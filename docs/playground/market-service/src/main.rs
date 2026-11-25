@@ -7,6 +7,7 @@ mod notifications;
 mod research;
 mod routes;
 mod signals;
+mod spike_trade;
 mod store;
 mod strategy;
 mod test_strategy;
@@ -68,14 +69,20 @@ async fn main() -> store::Result<()> {
         .as_ref()
         .map(|store| signals::Signals::new(Arc::clone(store), stopped.clone()).map(Arc::new))
         .transpose()?;
-    let app = routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), token)?;
-    let trading = trader.map(|trader| tokio::spawn(trading::supervise(trader, stopped.clone())));
+    let (app, liquidation) =
+        routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), token)?;
+    let trading = trader.as_ref().map(|trader| tokio::spawn(trading::supervise(Arc::clone(trader), stopped.clone())));
     let evaluating = signals.map(|signals| tokio::spawn(signals::supervise(signals, stopped.clone())));
-    let worker = store.as_ref().map(|store| {
+    let worker = store.zip(trader).map(|(store, trader)| {
+        let evaluator = Arc::new(spike_trade::Evaluator {
+            store: Arc::clone(&store), binance: Arc::clone(&binance), liquidation, trader,
+            stop: stopped.clone(), slots: tokio::sync::Semaphore::new(2),
+        });
         tokio::spawn(monitor::supervise(
-            Arc::clone(store),
+            store,
             Arc::clone(&binance),
             Arc::clone(&notifier),
+            evaluator,
             stopped,
         ))
     });

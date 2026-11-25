@@ -6,10 +6,11 @@ type RustMarketRoute = "/api/markets/contracts" | "/api/markets/alert-context" |
   "/api/markets/volume" | "/api/markets/contract-market-caps" | "/api/markets/fundamentals" | "/api/markets/holders" |
   TradingRoute | SignalRoute;
 type SignalRoute = "/api/signals" | "/api/signals/scan";
-type TradingRoute = "/api/trading" | "/api/trading/account" | "/api/trading/test-order" | "/api/trading/close";
+export type TradingRoute = "/api/trading" | "/api/trading/account" | "/api/trading/test-order" | "/api/trading/close" |
+  "/api/trading/position";
 const localRoutes = new Set<RustMarketRoute>([
   "/api/markets/background-monitor", "/api/strategy-notifications",
-  "/api/trading", "/api/trading/account", "/api/trading/test-order", "/api/trading/close",
+  "/api/trading", "/api/trading/account", "/api/trading/test-order", "/api/trading/close", "/api/trading/position",
   "/api/signals", "/api/signals/scan",
 ]);
 
