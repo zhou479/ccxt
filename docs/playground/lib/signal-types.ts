@@ -21,6 +21,10 @@ export type SignalFeatures = {
   quoteVolume24h: number | null;
   /** Beijing hour, 0–23. */
   hour: number;
+  /** Liquidated USDT in the 5 minutes before, pushing with the move (shorts on a rise, longs on a fall). */
+  liqSame5?: number | null;
+  /** Liquidated USDT in the 5 minutes before, against the move. */
+  liqOpp5?: number | null;
 };
 
 export type SignalSample = {
@@ -58,10 +62,22 @@ export type SignalScan = {
   params?: ScanParams;
 };
 
+export type ArchiveStatus = {
+  premiumSnapshots: number;
+  premiumAt: number | null;
+  liquidations: number;
+  liquidationAt: number | null;
+  longShortSymbols: number;
+  longShortAt: number | null;
+  cachedBars: number;
+  streamAt: number | null;
+};
+
 export type SignalSnapshot = {
   source: SignalSource;
   samples: SignalSample[];
   scan: SignalScan;
   barriers: { stop: number; take: number }[];
   horizons: number[];
+  archive?: ArchiveStatus | null;
 };

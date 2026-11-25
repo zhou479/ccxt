@@ -125,6 +125,11 @@ impl Store {
         self.1.with_extension("binance-account.json")
     }
 
+    /// Local market history cache and archive, kept apart from the monitor database.
+    pub fn history_path(&self) -> PathBuf {
+        self.1.with_extension("history.sqlite")
+    }
+
     pub(crate) fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.0
             .lock()

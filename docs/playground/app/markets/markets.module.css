@@ -510,3 +510,4 @@
 .signalStats > .monitorForm { margin-top: 10px; font-size: 13px; }
 .signalStats > .monitorForm input { width: 72px; }
 .signalStats td small, .signalStats th small { color: hsl(var(--warning)); }
+.signalStats td small.signalCredible { color: hsl(var(--success)); font-weight: 600; }

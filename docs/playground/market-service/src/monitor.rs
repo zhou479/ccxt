@@ -591,7 +591,7 @@ fn report_evaluation(job: std::result::Result<Result<()>, tokio::task::JoinError
 const MARKET_HOST: &str = "fstream.binance.com";
 const MARKET_STREAM: &str = "wss://fstream.binance.com/market/ws/!miniTicker@arr";
 const MAX_MARKET_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
-type MarketSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) type MarketSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn watch_tickers(tx: mpsc::Sender<(u64, Feed)>, generation: u64) {
     loop {
@@ -622,6 +622,11 @@ async fn watch_tickers(tx: mpsc::Sender<(u64, Feed)>, generation: u64) {
 }
 
 async fn connect_market_stream() -> Result<MarketSocket> {
+    connect_stream(MARKET_STREAM).await
+}
+
+/// Connects to a Binance futures market stream on `MARKET_HOST`, through the HTTP proxy when one is set.
+pub(crate) async fn connect_stream(url: &str) -> Result<MarketSocket> {
     let config = Some(WebSocketConfig {
         max_message_size: Some(MAX_MARKET_MESSAGE_BYTES),
         max_frame_size: Some(MAX_MARKET_MESSAGE_BYTES),
@@ -629,7 +634,7 @@ async fn connect_market_stream() -> Result<MarketSocket> {
     });
     let Some(proxy) = outbound_proxy().filter(|_| !no_proxy_market_host()) else {
         return Ok(
-            tokio_tungstenite::connect_async_with_config(MARKET_STREAM, config, false)
+            tokio_tungstenite::connect_async_with_config(url, config, false)
                 .await?
                 .0,
         );
@@ -664,7 +669,7 @@ async fn connect_market_stream() -> Result<MarketSocket> {
         return Err("HTTP CONNECT proxy rejected the market WebSocket".into());
     }
     Ok(
-        tokio_tungstenite::client_async_tls_with_config(MARKET_STREAM, tunnel, config, None)
+        tokio_tungstenite::client_async_tls_with_config(url, tunnel, config, None)
             .await?
             .0,
     )

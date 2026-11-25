@@ -1,4 +1,6 @@
+mod archive;
 mod binance;
+mod history;
 mod holders;
 mod liquidation;
 mod markets;
@@ -65,10 +67,19 @@ async fn main() -> store::Result<()> {
     });
     let (stop, stopped) = tokio::sync::watch::channel(false);
     // Signal statistics read alerts from the local database and evaluate them later.
+    let history = store
+        .as_ref()
+        .map(|store| history::History::open(&store.history_path()).map(Arc::new))
+        .transpose()?;
     let signals = store
         .as_ref()
-        .map(|store| signals::Signals::new(Arc::clone(store), stopped.clone()).map(Arc::new))
+        .zip(history.as_ref())
+        .map(|(store, history)| signals::Signals::new(Arc::clone(store), Arc::clone(history), stopped.clone()).map(Arc::new))
         .transpose()?;
+    // Data Binance keeps only briefly (or never) is archived for later factor research.
+    let archiving = history
+        .filter(|_| archive::enabled())
+        .map(|history| tokio::spawn(archive::supervise(history, stopped.clone())));
     let (app, liquidation) =
         routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), token)?;
     let trading = trader.as_ref().map(|trader| tokio::spawn(trading::supervise(Arc::clone(trader), stopped.clone())));
@@ -104,6 +115,9 @@ async fn main() -> store::Result<()> {
     }
     if let Some(evaluating) = evaluating {
         evaluating.await?;
+    }
+    if let Some(archiving) = archiving {
+        archiving.await?;
     }
     served?;
     Ok(())

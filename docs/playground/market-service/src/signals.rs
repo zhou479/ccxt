@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, Mutex};
 
 use crate::binance::{number, Binance, Endpoint, UpstreamError};
+use crate::history::{self, Bar, History, Kind};
 use crate::now_ms;
 use crate::store::Store;
 use crate::strategy::turnover_baseline;
@@ -51,18 +52,16 @@ const LIVE_ATTEMPTS: u32 = 3;
 const SAMPLE_LIMIT: i64 = 10_000;
 /// Open interest history only goes back about 30 days.
 const OPEN_INTEREST_DAYS: i64 = 29;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bar {
-    time: i64,
-    end: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    quote: f64,
-    taker_quote: f64,
-}
+/// Cached data this close to the requested end counts as current.
+const FRESH_BARS: i64 = 15 * MINUTE;
+const FRESH_FUNDING: i64 = HOUR;
+/// Liquidations in this window before a signal are recorded as a feature.
+const LIQUIDATION_WINDOW: i64 = 5 * MINUTE;
+/// Older values are treated as missing rather than as the current state.
+const MAX_BAR_AGE: i64 = 2 * MINUTE;
+const MAX_OPEN_INTEREST_AGE: i64 = 10 * MINUTE;
+/// Funding settles every 8 hours (more often on some contracts).
+const MAX_FUNDING_AGE: i64 = 9 * HOUR;
 
 fn parse_bars(rows: &[Vec<Value>], minutes: i64) -> Vec<Bar> {
     rows.iter()
@@ -93,16 +92,20 @@ fn percent(from: Option<f64>, to: Option<f64>) -> Option<f64> {
     (from > 0.0).then(|| round((to / from - 1.0) * 100.0)).filter(|value| value.is_finite())
 }
 
-/// Close of the latest bar that had finished by `time` (never looks ahead).
+/// Close of the latest bar that had finished by `time` (never looks ahead), if recent enough.
 fn close_before(bars: &[Bar], time: i64) -> Option<f64> {
     let index = bars.partition_point(|bar| bar.end <= time);
-    bars.get(index.checked_sub(1)?).map(|bar| bar.close)
+    bars.get(index.checked_sub(1)?)
+        .filter(|bar| time - bar.end <= MAX_BAR_AGE)
+        .map(|bar| bar.close)
 }
 
-/// Latest value recorded at or before `time`.
-fn value_before(points: &[(i64, f64)], time: i64) -> Option<f64> {
+/// Latest value recorded at or before `time`, unless it is older than `max_age`.
+fn value_before(points: &[(i64, f64)], time: i64, max_age: i64) -> Option<f64> {
     let index = points.partition_point(|(at, _)| *at <= time);
-    points.get(index.checked_sub(1)?).map(|(_, value)| *value)
+    points.get(index.checked_sub(1)?)
+        .filter(|(at, _)| time - at <= max_age)
+        .map(|(_, value)| *value)
 }
 
 /// Result of one simulated trade.
@@ -177,6 +180,10 @@ fn outcome(entry: f64, sign: f64, start: i64, bars: &[Bar]) -> Option<Value> {
 
 struct Inputs<'a> {
     time: i64,
+    /// +1 for an upward move, -1 for a downward one.
+    sign: f64,
+    /// Liquidated value before the signal: (closing shorts, closing longs).
+    liquidations: Option<(f64, f64)>,
     window_ms: i64,
     bars: &'a [Bar],
     btc: &'a [Bar],
@@ -191,15 +198,19 @@ fn features(input: Inputs) -> Value {
     let start = input.time - input.window_ms;
     let btc_window = input.window_ms.max(MINUTE);
     let hour = (input.time + BEIJING_OFFSET_MS).rem_euclid(DAY) / HOUR;
+    let oi = |time| value_before(input.open_interest, time, MAX_OPEN_INTEREST_AGE);
     json!({
         "pre60": percent(close_before(input.bars, start - HOUR), close_before(input.bars, start)),
         "btcWindow": percent(close_before(input.btc, input.time - btc_window), close_before(input.btc, input.time)),
         "btcPre60": percent(close_before(input.btc, start - HOUR), close_before(input.btc, start)),
         "takerBuyShare": input.taker_buy_share.map(round),
-        "oiChange15": percent(value_before(input.open_interest, input.time - 15 * MINUTE), value_before(input.open_interest, input.time)),
-        "oiChange60": percent(value_before(input.open_interest, input.time - HOUR), value_before(input.open_interest, input.time)),
-        "fundingRate": value_before(input.funding, input.time).map(|rate| round(rate * 100.0)),
+        "oiChange15": percent(oi(input.time - 15 * MINUTE), oi(input.time)),
+        "oiChange60": percent(oi(input.time - HOUR), oi(input.time)),
+        "fundingRate": value_before(input.funding, input.time, MAX_FUNDING_AGE).map(|rate| round(rate * 100.0)),
         "quoteVolume24h": input.quote_volume_24h.map(f64::round),
+        // Liquidations pushing the same way as the move: shorts closed on a rise, longs on a fall.
+        "liqSame5": input.liquidations.map(|(shorts, longs)| (if input.sign > 0.0 { shorts } else { longs }).round()),
+        "liqOpp5": input.liquidations.map(|(shorts, longs)| (if input.sign > 0.0 { longs } else { shorts }).round()),
         "hour": hour,
     })
 }
@@ -295,15 +306,13 @@ struct ScanState {
 
 pub struct Signals {
     store: Arc<Store>,
-    /// A separate client, so long scans never queue behind the page's market requests.
-    binance: Binance,
+    fetch: Fetcher,
     scan: Mutex<ScanState>,
     attempts: Mutex<HashMap<String, u32>>,
-    stop: watch::Receiver<bool>,
 }
 
 impl Signals {
-    pub fn new(store: Arc<Store>, stop: watch::Receiver<bool>) -> crate::store::Result<Self> {
+    pub fn new(store: Arc<Store>, history: Arc<History>, stop: watch::Receiver<bool>) -> crate::store::Result<Self> {
         store.db()?.execute_batch(
             "CREATE TABLE IF NOT EXISTS signal_sample (
                 id TEXT PRIMARY KEY, source TEXT NOT NULL, symbol TEXT NOT NULL, time INTEGER NOT NULL,
@@ -325,16 +334,11 @@ impl Signals {
         }
         let signals = Self {
             store,
-            binance: Binance::new(),
+            fetch: Fetcher::new(history, stop, REQUEST_GAP),
             scan: Mutex::new(ScanState { value }),
             attempts: Mutex::new(HashMap::new()),
-            stop,
         };
         Ok(signals)
-    }
-
-    fn stopped(&self) -> bool {
-        *self.stop.borrow()
     }
 
     /// Samples of one source plus the scan state, for the page.
@@ -349,6 +353,7 @@ impl Signals {
             "scan": scan,
             "barriers": BARRIERS.iter().map(|(stop, take)| json!({"stop": stop, "take": take})).collect::<Vec<_>>(),
             "horizons": HORIZONS,
+            "archive": self.fetch.history().status().ok(),
         }))
     }
 
@@ -426,13 +431,8 @@ impl Signals {
         let from = now - params.days * DAY;
         // One extra day for the 24h volume, plus the turnover baseline before the first signal.
         let fetch_from = from - DAY - 2 * HOUR;
-        let directory = self
-            .binance
-            .directory(60_000)
-            .await
-            .map_err(|_| "无法读取币安合约列表。".to_owned())?;
-        let listed: HashSet<_> = directory.contracts.iter().map(|contract| contract.id.clone()).collect();
-        let tickers: Vec<Value> = self.get(Endpoint::Ticker, json!({})).await?;
+        let listed: HashSet<_> = self.fetch.listed().await?.into_iter().collect();
+        let tickers: Vec<Value> = self.fetch.get(Endpoint::Ticker, json!({})).await?;
         let mut universe: Vec<(String, f64)> = tickers
             .iter()
             .filter_map(|ticker| {
@@ -448,10 +448,10 @@ impl Signals {
             .map_err(|_| "无法清理上次的扫描结果。".to_owned())?;
         let total = universe.len();
         self.set_scan(|state| state["total"] = json!(total)).await;
-        let btc = self.minute_bars("BTCUSDT", fetch_from, now).await?;
+        let btc = self.fetch.cached_bars("BTCUSDT", fetch_from, now).await?;
         let (mut samples, mut skipped) = (0, 0);
         for (done, (symbol, _)) in universe.iter().enumerate() {
-            if self.stopped() {
+            if self.fetch.stopped() {
                 return Err("服务正在关闭，扫描已停止。".into());
             }
             match self.scan_symbol(symbol, &params, &btc, from, fetch_from, now).await {
@@ -482,14 +482,14 @@ impl Signals {
         fetch_from: i64,
         now: i64,
     ) -> Result<Vec<Value>, String> {
-        let bars = self.minute_bars(symbol, fetch_from, now).await?;
+        let bars = self.fetch.cached_bars(symbol, fetch_from, now).await?;
         let detections = detect(&bars, params, from);
         let Some(first) = detections.first() else {
             return Ok(Vec::new());
         };
         let earliest = bars[first.index].end - 2 * HOUR;
-        let open_interest = self.open_interest(symbol, earliest, now).await.unwrap_or_default();
-        let funding = self.funding(symbol, earliest - DAY, now).await.unwrap_or_default();
+        let open_interest = self.fetch.cached_points(symbol, Kind::OpenInterest, earliest, now).await.unwrap_or_default();
+        let funding = self.fetch.cached_points(symbol, Kind::Funding, earliest - DAY, now).await.unwrap_or_default();
         let mut sums = vec![0.0];
         for bar in &bars {
             sums.push(sums.last().copied().unwrap_or(0.0) + bar.quote);
@@ -505,6 +505,8 @@ impl Signals {
             };
             let features = features(Inputs {
                 time: signal.end,
+                sign,
+                liquidations: self.liquidations_before(symbol, signal.end),
                 window_ms: window as i64 * MINUTE,
                 bars: &bars,
                 btc,
@@ -530,6 +532,11 @@ impl Signals {
         Ok(samples)
     }
 
+    /// Archived liquidations in the five minutes before a signal, when the stream was running then.
+    fn liquidations_before(&self, symbol: &str, time: i64) -> Option<(f64, f64)> {
+        self.fetch.history().liquidations(symbol, time - LIQUIDATION_WINDOW, time).ok().flatten()
+    }
+
     /// Evaluates live spikes whose hour of follow-up has finished.
     async fn evaluate_due(&self) {
         let due = match self.due_spikes() {
@@ -537,7 +544,7 @@ impl Signals {
             Err(_) => return,
         };
         for spike in due {
-            if self.stopped() {
+            if self.fetch.stopped() {
                 return;
             }
             let id = format!("live:{}", crate::store::spike_id(&spike));
@@ -580,10 +587,10 @@ impl Signals {
         let minute = time.div_euclid(MINUTE) * MINUTE;
         let next_minute = minute + MINUTE;
         let range = (minute - HOUR - window_ms.div_euclid(MINUTE) * MINUTE - 2 * MINUTE, minute + (HOLD_MINUTES + 2) * MINUTE);
-        let bars = self.minute_bars(symbol, range.0, range.1).await?;
-        let btc = self.minute_bars("BTCUSDT", range.0, range.1).await?;
+        let bars = self.fetch.minute_bars(symbol, range.0, range.1).await?;
+        let btc = self.fetch.minute_bars("BTCUSDT", range.0, range.1).await?;
         // Trades give the exact path inside the alert's minute and the taker share in the window.
-        let trades = self.trades(symbol, time - window_ms, next_minute).await.ok();
+        let trades = self.fetch.trades(symbol, time - window_ms, next_minute).await.ok();
         let taker_buy_share = trades.as_ref().and_then(|trades| {
             let window: Vec<_> = trades.iter().filter(|trade| trade.0 < time).collect();
             let total: f64 = window.iter().map(|trade| trade.1 * trade.2).sum();
@@ -607,11 +614,13 @@ impl Signals {
         path.extend(bars.iter().copied().filter(|bar| bar.time >= next_minute));
         let sign = change.signum();
         let result = outcome(price, sign, time, &path).ok_or("告警后的K线还不完整。")?;
-        let open_interest = self.open_interest_at(symbol, time).await.unwrap_or_default();
-        let funding = self.funding(symbol, time - DAY, time).await.unwrap_or_default();
-        let quote_volume_24h = self.quote_volume_24h(symbol, time).await.ok().flatten();
+        let open_interest = self.fetch.open_interest_at(symbol, time).await.unwrap_or_default();
+        let funding = self.fetch.funding(symbol, time - DAY, time).await.unwrap_or_default();
+        let quote_volume_24h = self.fetch.quote_volume_24h(symbol, time).await.ok().flatten();
         let features = features(Inputs {
             time,
+            sign,
+            liquidations: self.liquidations_before(symbol, time),
             window_ms,
             bars: &bars,
             btc: &btc,
@@ -640,12 +649,81 @@ impl Signals {
         ))
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, endpoint: Endpoint, query: Value) -> Result<T, String> {
+}
+
+/// Paced Binance requests with a local cache for historical data. Each user (scan, archive) owns one,
+/// with its own client so long downloads never queue behind the page's market requests.
+pub(crate) struct Fetcher {
+    binance: Binance,
+    history: Arc<History>,
+    stop: watch::Receiver<bool>,
+    gap: Duration,
+}
+
+impl Fetcher {
+    pub(crate) fn new(history: Arc<History>, stop: watch::Receiver<bool>, gap: Duration) -> Self {
+        Self { binance: Binance::new(), history, stop, gap }
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    pub(crate) fn history(&self) -> &History {
+        &self.history
+    }
+
+    pub(crate) async fn listed(&self) -> Result<Vec<String>, String> {
+        let directory = self.binance.directory(60_000).await.map_err(|_| "无法读取币安合约列表。".to_owned())?;
+        Ok(directory.contracts.into_iter().map(|contract| contract.id).collect())
+    }
+
+    /// One-minute bars in `[start, end)`, downloading only what the cache does not have yet.
+    pub(crate) async fn cached_bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>, String> {
+        let end = end.min(now_ms().div_euclid(MINUTE) * MINUTE);
+        let coverage = self.history.coverage(symbol, Kind::Klines).map_err(cache_error)?;
+        for (from, to) in history::missing(coverage, start, fresh_end(coverage, end, FRESH_BARS)) {
+            let bars = self.minute_bars(symbol, from, to).await?;
+            self.history.save_bars(symbol, &bars).map_err(cache_error)?;
+            self.extend(symbol, Kind::Klines, from, to)?;
+        }
+        self.history.bars(symbol, start, end).map_err(cache_error)
+    }
+
+    /// Open interest or funding in `[start, end]`, downloading only what the cache does not have yet.
+    /// Open interest older than Binance's 30-day window comes from the cache alone.
+    pub(crate) async fn cached_points(&self, symbol: &str, kind: Kind, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
+        let now = now_ms();
+        let end = end.min(now);
+        let fetch_start = match kind {
+            Kind::OpenInterest => start.max(now - OPEN_INTEREST_DAYS * DAY),
+            _ => start,
+        };
+        let coverage = self.history.coverage(symbol, kind).map_err(cache_error)?;
+        let tolerance = if kind == Kind::Funding { FRESH_FUNDING } else { FRESH_BARS };
+        for (from, to) in history::missing(coverage, fetch_start, fresh_end(coverage, end, tolerance)) {
+            let points = match kind {
+                Kind::OpenInterest => self.open_interest(symbol, from, to).await?,
+                Kind::Funding => self.funding(symbol, from, to).await?,
+                Kind::Klines => return Err("K线请使用 cached_bars。".into()),
+            };
+            self.history.save_points(symbol, kind, &points).map_err(cache_error)?;
+            self.extend(symbol, kind, from, to)?;
+        }
+        self.history.points(symbol, kind, start, end).map_err(cache_error)
+    }
+
+    fn extend(&self, symbol: &str, kind: Kind, from: i64, to: i64) -> Result<(), String> {
+        let (start, end) = self.history.coverage(symbol, kind).map_err(cache_error)?.unwrap_or((from, to));
+        self.history.set_coverage(symbol, kind, start.min(from), end.max(to)).map_err(cache_error)
+    }
+
+    pub(crate) async fn get<T: serde::de::DeserializeOwned>(&self, endpoint: Endpoint, query: Value) -> Result<T, String> {
         for attempt in 0..3 {
             if self.stopped() {
                 return Err("服务正在关闭。".into());
             }
-            tokio::time::sleep(REQUEST_GAP).await;
+            tokio::time::sleep(self.gap).await;
             match self.binance.get(endpoint, query.clone()).await {
                 Ok(value) => return Ok(value),
                 Err(UpstreamError::Missing) => return Err("币安没有这个合约的数据。".into()),
@@ -658,7 +736,7 @@ impl Signals {
     }
 
     /// Finished one-minute bars in `[start, end)`.
-    async fn minute_bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>, String> {
+    pub(crate) async fn minute_bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>, String> {
         let end = end.min(now_ms());
         let mut bars: Vec<Bar> = Vec::new();
         let mut cursor = start;
@@ -684,7 +762,7 @@ impl Signals {
     }
 
     /// Open interest (contracts) every five minutes, oldest first.
-    async fn open_interest(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
+    pub(crate) async fn open_interest(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
         let start = start.max(now_ms() - OPEN_INTEREST_DAYS * DAY);
         let mut points = Vec::new();
         let mut cursor = end;
@@ -710,7 +788,7 @@ impl Signals {
         Ok(points)
     }
 
-    async fn open_interest_at(&self, symbol: &str, time: i64) -> Result<Vec<(i64, f64)>, String> {
+    pub(crate) async fn open_interest_at(&self, symbol: &str, time: i64) -> Result<Vec<(i64, f64)>, String> {
         if time < now_ms() - OPEN_INTEREST_DAYS * DAY {
             return Ok(Vec::new());
         }
@@ -720,7 +798,7 @@ impl Signals {
         Ok(open_interest_points(&rows))
     }
 
-    async fn funding(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
+    pub(crate) async fn funding(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
         let rows: Vec<Value> = self
             .get(Endpoint::FundingHistory, json!({"symbol": symbol, "startTime": start, "endTime": end, "limit": 1000}))
             .await?;
@@ -732,7 +810,7 @@ impl Signals {
         Ok(points)
     }
 
-    async fn quote_volume_24h(&self, symbol: &str, time: i64) -> Result<Option<f64>, String> {
+    pub(crate) async fn quote_volume_24h(&self, symbol: &str, time: i64) -> Result<Option<f64>, String> {
         let rows: Vec<Vec<Value>> = self
             .get(Endpoint::Klines, json!({
                 "symbol": symbol, "interval": "1h", "startTime": time - DAY - HOUR, "endTime": time, "limit": 26,
@@ -743,7 +821,7 @@ impl Signals {
     }
 
     /// Aggregate trades in `[start, end)` as (time, price, quantity, buyer is maker).
-    async fn trades(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64, f64, bool)>, String> {
+    pub(crate) async fn trades(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64, f64, bool)>, String> {
         let mut trades = Vec::new();
         let mut from_id: Option<i64> = None;
         for _ in 0..MAX_TRADE_PAGES {
@@ -770,6 +848,19 @@ impl Signals {
         }
         Err("告警附近成交过多，改用K线估算。".into())
     }
+}
+
+/// A cache that reaches to within `tolerance` of `end` is used as it is, so repeated scans skip
+/// a round of requests just for the last few minutes.
+fn fresh_end(coverage: Option<(i64, i64)>, end: i64, tolerance: i64) -> i64 {
+    match coverage {
+        Some((_, covered)) if covered < end && end - covered <= tolerance => covered,
+        _ => end,
+    }
+}
+
+fn cache_error(_: Box<dyn std::error::Error + Send + Sync>) -> String {
+    "无法读写本地历史数据缓存。".to_owned()
 }
 
 fn open_interest_points(rows: &[Value]) -> Vec<(i64, f64)> {
@@ -874,11 +965,19 @@ mod tests {
         }
         let time = 130 * MINUTE;
         let value = features(Inputs {
-            time, window_ms: 5 * MINUTE, bars: &bars, btc: &bars, open_interest: &[(0, 10.0), (time, 11.0), (time + 1, 99.0)],
+            time, window_ms: 5 * MINUTE, bars: &bars, btc: &bars,
+            open_interest: &[(0, 1.0), (time - HOUR, 10.0), (time - 30 * MINUTE, 10.5), (time, 11.0), (time + 1, 99.0)],
             funding: &[(0, 0.0001)], taker_buy_share: Some(0.6), quote_volume_24h: None,
+            sign: -1.0, liquidations: Some((100.0, 300.0)),
         });
+        assert_eq!((value["liqSame5"].clone(), value["liqOpp5"].clone()), (json!(300.0), json!(100.0)));
         assert_eq!(value["pre60"], json!(0.0));
         assert_eq!(value["oiChange60"], json!(10.0));
+        // The nearest value before 15 minutes earlier is 15 minutes older still: missing, not stale.
+        assert_eq!(value["oiChange15"], Value::Null);
+        // A gap in the bars makes the earlier price missing too.
+        let gapped: Vec<_> = bars.iter().copied().filter(|bar| !(50 * MINUTE..70 * MINUTE).contains(&bar.time)).collect();
+        assert_eq!(close_before(&gapped, 65 * MINUTE), None);
         assert_eq!(value["fundingRate"], json!(0.01));
         assert_eq!(value["hour"], json!(10));
     }
@@ -906,11 +1005,18 @@ mod tests {
         assert!(detect(&gap, &params, 0).is_empty());
     }
 
+    #[test]
+    fn a_nearly_current_cache_is_used_without_downloading_the_last_minutes() {
+        assert_eq!(fresh_end(Some((0, 100 * MINUTE)), 110 * MINUTE, FRESH_BARS), 100 * MINUTE);
+        assert_eq!(fresh_end(Some((0, 100 * MINUTE)), 130 * MINUTE, FRESH_BARS), 130 * MINUTE);
+        assert_eq!(fresh_end(None, 130 * MINUTE, FRESH_BARS), 130 * MINUTE);
+    }
+
     #[tokio::test]
     async fn live_spikes_are_evaluated_once_and_scan_samples_are_listed_by_source() {
         let store = Arc::new(Store::open_memory().unwrap());
         let (_stop, stopped) = watch::channel(false);
-        let signals = Signals::new(Arc::clone(&store), stopped).unwrap();
+        let signals = Signals::new(Arc::clone(&store), Arc::new(History::open_memory().unwrap()), stopped).unwrap();
         let old = now_ms() - 2 * HOUR;
         for (time, status) in [(old, "alerted"), (old + 1, "below-threshold"), (old + 2, "pending"), (now_ms(), "alerted")] {
             store.record_spike(&json!({"symbol": "BTCUSDT", "time": time, "threshold": 2.0, "status": status})).unwrap();

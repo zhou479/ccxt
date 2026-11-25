@@ -2,17 +2,104 @@ import type { SignalExit, SignalSample } from "./signal-types";
 
 /** Groups with fewer samples than this are flagged: the numbers are mostly noise. */
 export const MIN_SAMPLES = 30;
+/** A result counts as credible only with this many independent events behind it. */
+export const MIN_EVENTS = 50;
+/** Credible results must clear this net average per trade, %, leaving room for live slippage. */
+export const MIN_EDGE = 0.15;
+/** Credible results must win at least this many times what they lose. */
+export const MIN_PROFIT_FACTOR = 1.2;
+/** Credible results must survive removing this many best trades. */
+export const TRIMMED_TRADES = 2;
+/** Liquidity floor options: 24h turnover before the signal, USDT. */
+export const LIQUIDITY_OPTIONS = [0, 2e7, 1e8] as const;
 /** Round-trip cost per trade, %: taker fees on both sides plus slippage. */
 export const COST_OPTIONS = [0.1, 0.15, 0.2, 0.3] as const;
 export const DEFAULT_COST = 0.2;
+/** Symbols that moved during this much time before a signal count as moving with it. */
+export const CONCURRENCY_WINDOW_MS = 5 * 60_000;
+/** Samples closer than this in time belong to the same market event. */
+export const EVENT_GAP_MS = 15 * 60_000;
+/** A symbol is sampled at most once per this interval (the historical scan already does this). */
+export const SYMBOL_COOLDOWN_MS = 30 * 60_000;
 
-export type SampleFilter = { direction: "all" | "up" | "down"; minMultiple: number; alertedOnly: boolean };
+export type MarketKind = "single" | "mixed" | "market";
 
-export function filterSamples(samples: readonly SignalSample[], filter: SampleFilter): SignalSample[] {
+/** How many symbols moved together decides whether a move was the coin's own or the whole market's. */
+export function marketKind(concurrent: number): MarketKind {
+  return concurrent <= 3 ? "single" : concurrent >= 10 ? "market" : "mixed";
+}
+
+export type SampleContext = {
+  /**
+   * Symbols (including this one) with a sample in the CONCURRENCY_WINDOW_MS before it. Only the past
+   * counts, exactly as a live strategy would see it: the first coin of a market-wide move looks alone.
+   */
+  concurrent: number;
+  /** The move minus BTC's move over the same window, % (null without BTC data). */
+  excess: number | null;
+  /** Samples sharing an event id happened in one burst of market activity. */
+  event: number;
+  /** 0 for the earlier half of the period, 1 for the later half. */
+  half: 0 | 1;
+  /** Same symbol sampled again within SYMBOL_COOLDOWN_MS. */
+  repeat: boolean;
+};
+
+export type StudySample = SignalSample & { context: SampleContext };
+
+/**
+ * Adds cross-sample context. Always computed on the whole source, before any filter,
+ * so that filtering never changes a sample's concurrency, event or half.
+ */
+export function prepareSamples(samples: readonly SignalSample[]): StudySample[] {
+  const sorted = [...samples].sort((a, b) => a.time - b.time || a.symbol.localeCompare(b.symbol));
+  const middle = sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)].time : 0;
+  const lastBySymbol = new Map<string, number>();
+  let event = 0;
+  let start = 0;
+  return sorted.map((sample, index) => {
+    // Events group samples for statistics only, so they may look both ways.
+    if (index > 0 && sample.time - sorted[index - 1].time > EVENT_GAP_MS) event += 1;
+    while (sorted[start].time < sample.time - CONCURRENCY_WINDOW_MS) start += 1;
+    // Samples with the very same timestamp closed on the same bar, which a strategy acting at the
+    // bar's close (as the scan's entries do) would already have seen.
+    let end = index;
+    while (end + 1 < sorted.length && sorted[end + 1].time === sample.time) end += 1;
+    const symbols = new Set(sorted.slice(start, end + 1).map(({ symbol }) => symbol));
+    const previous = lastBySymbol.get(sample.symbol);
+    const repeat = previous !== undefined && sample.time - previous < SYMBOL_COOLDOWN_MS;
+    if (!repeat) lastBySymbol.set(sample.symbol, sample.time);
+    const btc = sample.features.btcWindow;
+    return {
+      ...sample,
+      context: {
+        concurrent: symbols.size,
+        excess: btc === null ? null : Math.round((sample.change - btc) * 10_000) / 10_000,
+        event,
+        half: sample.time <= middle ? 0 : 1,
+        repeat,
+      },
+    };
+  });
+}
+
+export type SampleFilter = {
+  direction: "all" | "up" | "down";
+  minMultiple: number;
+  alertedOnly: boolean;
+  market: "all" | MarketKind;
+  /** Minimum 24h turnover before the signal, USDT; 0 keeps samples without the figure. */
+  minVolume: number;
+};
+
+export function filterSamples(samples: readonly StudySample[], filter: SampleFilter): StudySample[] {
   return samples.filter((sample) =>
+    !sample.context.repeat &&
     (filter.direction === "all" || sample.direction === filter.direction) &&
     (filter.minMultiple <= 0 || (sample.turnoverMultiple ?? -Infinity) >= filter.minMultiple) &&
-    (!filter.alertedOnly || sample.status !== "below-threshold"));
+    (!filter.alertedOnly || sample.status !== "below-threshold") &&
+    (filter.market === "all" || marketKind(sample.context.concurrent) === filter.market) &&
+    (filter.minVolume <= 0 || (sample.features.quoteVolume24h ?? 0) >= filter.minVolume));
 }
 
 function mean(values: readonly number[]): number | null {
@@ -58,15 +145,61 @@ export function tradeStats(exits: readonly (SignalExit | null | undefined)[], co
   };
 }
 
-export type BarrierRow = { stop: number; take: number; chase: TradeStats; fade: TradeStats };
+export type OutcomeStats = TradeStats & {
+  /** Independent market events behind the trades. */
+  events: number;
+  /** Share of events whose trades made money on average. */
+  eventWinRate: number | null;
+  /** Average net result in the earlier and the later half of the period. */
+  halves: [number | null, number | null];
+  /** Total net gains divided by total net losses; null without losses. */
+  profitFactor: number | null;
+  /** Average net result without the TRIMMED_TRADES best trades. */
+  trimmed: number | null;
+  /** Clears MIN_EDGE and MIN_PROFIT_FACTOR, positive in both halves and after trimming, with enough events. */
+  credible: boolean;
+};
+
+type Side = "chase" | "fade";
+
+/** Trade statistics that also look at independent events and at both halves of the period. */
+export function outcomeStats(samples: readonly StudySample[], barrier: number, side: Side, cost: number): OutcomeStats {
+  const trades = samples.flatMap((sample) => {
+    const exit = sample.barriers[barrier]?.[side];
+    return exit ? [{ sample, exit, net: exit.pnl - cost }] : [];
+  });
+  const base = tradeStats(trades.map(({ exit }) => exit), cost);
+  const byEvent = new Map<number, number[]>();
+  for (const { sample, net } of trades) byEvent.set(sample.context.event, [...(byEvent.get(sample.context.event) ?? []), net]);
+  const eventMeans = [...byEvent.values()].map((values) => mean(values) ?? 0);
+  const halves = ([0, 1] as const).map((half) =>
+    mean(trades.filter(({ sample }) => sample.context.half === half).map(({ net }) => net))) as [number | null, number | null];
+  const nets = trades.map(({ net }) => net).sort((a, b) => a - b);
+  const gains = nets.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
+  const losses = -nets.filter((value) => value < 0).reduce((sum, value) => sum + value, 0);
+  const profitFactor = losses > 0 ? gains / losses : null;
+  const trimmed = mean(nets.slice(0, Math.max(0, nets.length - TRIMMED_TRADES)));
+  return {
+    ...base,
+    events: byEvent.size,
+    eventWinRate: eventMeans.length ? eventMeans.filter((value) => value > 0).length / eventMeans.length : null,
+    halves,
+    profitFactor,
+    trimmed,
+    credible: (base.average ?? 0) >= MIN_EDGE && halves.every((value) => value !== null && value > 0) &&
+      (profitFactor === null || profitFactor >= MIN_PROFIT_FACTOR) && (trimmed ?? 0) > 0 && byEvent.size >= MIN_EVENTS,
+  };
+}
+
+export type BarrierRow = { stop: number; take: number; chase: OutcomeStats; fade: OutcomeStats };
 
 /** Simulated results per stop-loss / take-profit pair, chasing the move and fading it. */
-export function barrierStats(samples: readonly SignalSample[], barriers: readonly { stop: number; take: number }[],
+export function barrierStats(samples: readonly StudySample[], barriers: readonly { stop: number; take: number }[],
   cost: number): BarrierRow[] {
   return barriers.map(({ stop, take }, index) => ({
     stop, take,
-    chase: tradeStats(samples.map((sample) => sample.barriers[index]?.chase), cost),
-    fade: tradeStats(samples.map((sample) => sample.barriers[index]?.fade), cost),
+    chase: outcomeStats(samples, index, "chase", cost),
+    fade: outcomeStats(samples, index, "fade", cost),
   }));
 }
 
@@ -92,7 +225,7 @@ function aligned(sample: SignalSample, value: number | null) {
   return value === null ? null : sample.direction === "up" ? value : -value;
 }
 
-type Bucket = (sample: SignalSample) => string | null;
+type Bucket = (sample: StudySample) => string | null;
 
 function ranges(value: number | null, edges: readonly [number, string][], below: string) {
   if (value === null || !Number.isFinite(value)) return null;
@@ -101,9 +234,19 @@ function ranges(value: number | null, edges: readonly [number, string][], below:
   return label;
 }
 
+/** Liquidations are only known while the archive's stream was connected. */
+function liquidationBucket(value: number | null | undefined) {
+  if (value === null || value === undefined) return "未接收";
+  return value === 0 ? "无爆仓" : ranges(value, [[1e5, "10–100 万"], [1e6, "≥100 万"]], "<10 万");
+}
+
 export type SignalGroup = { id: string; label: string; order: readonly string[]; bucket: Bucket };
 
 export const SIGNAL_GROUPS: readonly SignalGroup[] = [
+  { id: "market", label: "同时异动币数", order: ["个币独立（≤3 个）", "中间（4–9 个）", "全市场（≥10 个）"],
+    bucket: (sample) => ({ single: "个币独立（≤3 个）", mixed: "中间（4–9 个）", market: "全市场（≥10 个）" })[marketKind(sample.context.concurrent)] },
+  { id: "excess", label: "相对 BTC 的超额涨跌", order: ["<2%", "2–3%", "3–5%", "5–10%", "≥10%", "未知"],
+    bucket: (sample) => ranges(aligned(sample, sample.context.excess), [[2, "2–3%"], [3, "3–5%"], [5, "5–10%"], [10, "≥10%"]], "<2%") ?? "未知" },
   { id: "direction", label: "异动方向", order: ["上涨异动（追多）", "下跌异动（追空）"],
     bucket: (sample) => sample.direction === "up" ? "上涨异动（追多）" : "下跌异动（追空）" },
   { id: "change", label: "窗口涨跌幅", order: ["<2%", "2–3%", "3–5%", "5–10%", "≥10%"],
@@ -130,18 +273,22 @@ export const SIGNAL_GROUPS: readonly SignalGroup[] = [
   { id: "liquidity", label: "24 小时成交额", order: ["<2000 万", "2000 万–1 亿", "1–5 亿", "≥5 亿", "未知"],
     bucket: (sample) => ranges(sample.features.quoteVolume24h,
       [[2e7, "2000 万–1 亿"], [1e8, "1–5 亿"], [5e8, "≥5 亿"]], "<2000 万") ?? "未知" },
+  { id: "liqSame", label: "前 5 分钟顺向爆仓", order: ["无爆仓", "<10 万", "10–100 万", "≥100 万", "未接收"],
+    bucket: (sample) => liquidationBucket(sample.features.liqSame5) },
+  { id: "liqOpp", label: "前 5 分钟反向爆仓", order: ["无爆仓", "<10 万", "10–100 万", "≥100 万", "未接收"],
+    bucket: (sample) => liquidationBucket(sample.features.liqOpp5) },
   { id: "hour", label: "北京时间", order: ["0–6 点", "6–12 点", "12–18 点", "18–24 点"],
     bucket: (sample) => ["0–6 点", "6–12 点", "12–18 点", "18–24 点"][Math.floor(sample.features.hour / 6)] ?? null },
   { id: "status", label: "成交额核验（实时告警）", order: ["已告警", "成交额不足"],
     bucket: (sample) => sample.status === "alerted" ? "已告警" : sample.status === "below-threshold" ? "成交额不足" : null },
 ];
 
-export type GroupRow = { bucket: string; chase: TradeStats; fade: TradeStats };
+export type GroupRow = { bucket: string; chase: OutcomeStats; fade: OutcomeStats };
 
-export function groupStats(samples: readonly SignalSample[], groupId: string, barrier: number, cost: number): GroupRow[] {
+export function groupStats(samples: readonly StudySample[], groupId: string, barrier: number, cost: number): GroupRow[] {
   const group = SIGNAL_GROUPS.find(({ id }) => id === groupId);
   if (!group) return [];
-  const buckets = new Map<string, SignalSample[]>();
+  const buckets = new Map<string, StudySample[]>();
   for (const sample of samples) {
     const bucket = group.bucket(sample);
     if (bucket === null) continue;
@@ -151,8 +298,8 @@ export function groupStats(samples: readonly SignalSample[], groupId: string, ba
     const rows = buckets.get(bucket) ?? [];
     return {
       bucket,
-      chase: tradeStats(rows.map((sample) => sample.barriers[barrier]?.chase), cost),
-      fade: tradeStats(rows.map((sample) => sample.barriers[barrier]?.fade), cost),
+      chase: outcomeStats(rows, barrier, "chase", cost),
+      fade: outcomeStats(rows, barrier, "fade", cost),
     };
   });
 }
