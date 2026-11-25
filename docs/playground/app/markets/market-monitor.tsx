@@ -19,6 +19,7 @@ import AlertRecords from "./alert-records";
 import { useStrategyNotifications } from "./use-strategy-notifications";
 import DingTalkSettings from "./dingtalk-settings";
 import BinanceSettings from "./binance-settings";
+import SignalStats from "./signal-stats";
 import TestStrategy from "./test-strategy";
 import TradeRecords from "./trade-records";
 import { useTrading } from "./use-trading";
@@ -588,6 +589,7 @@ export default function MarketMonitor({ contracts, coinCount, directoryError }: 
         </div>
       </details>
       {strategy}
+      <SignalStats />
       <TestStrategy mode={trading.mode} status={trading.data} error={trading.error} onSubmit={trading.placeTestOrder} />
       <TradeRecords trades={trading.data?.trades ?? []} activeMode={trading.data?.enabled ? trading.data.mode : "off"}
         canDelete={trading.mode === "local"} onDelete={trading.deleteTrades} onClose={trading.closeTrade} />

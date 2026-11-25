@@ -106,7 +106,7 @@ impl Store {
         self.1.with_extension("binance-account.json")
     }
 
-    fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+    pub(crate) fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.0
             .lock()
             .map_err(|_| "market monitor database lock poisoned".into())

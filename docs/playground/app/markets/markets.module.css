@@ -500,3 +500,8 @@
 .tradeOrders ul { margin: 4px 0 0; padding-inline-start: 20px; }
 .tradePagination { margin-top: 12px; color: hsl(var(--muted-foreground)); font-size: 13px; }
 .tradeFeeNote { margin: 12px 0 0; color: hsl(var(--muted-foreground)); font-size: 12px; line-height: 1.5; }
+
+.signalStats h4 { margin-top: 18px; }
+.signalStats > .monitorForm { margin-top: 10px; font-size: 13px; }
+.signalStats > .monitorForm input { width: 72px; }
+.signalStats td small, .signalStats th small { color: hsl(var(--warning)); }

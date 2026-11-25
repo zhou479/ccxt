@@ -32,6 +32,7 @@ struct Service {
     research: Arc<crate::research::Research>,
     holders: Arc<crate::holders::Holders>,
     trader: Option<Arc<Trader>>,
+    signals: Option<Arc<crate::signals::Signals>>,
 }
 
 pub fn router(
@@ -39,6 +40,7 @@ pub fn router(
     store: Option<Arc<Store>>,
     notifier: Arc<Notifier>,
     trader: Option<Arc<Trader>>,
+    signals: Option<Arc<crate::signals::Signals>>,
     token: Option<Arc<str>>,
 ) -> crate::store::Result<Router> {
     let markets = Arc::new(Markets::new(Arc::clone(&binance))?);
@@ -66,6 +68,8 @@ pub fn router(
         .route("/api/trading/account", axum::routing::put(trading_account))
         .route("/api/trading/test-order", post(trading_test_order))
         .route("/api/trading/close", post(trading_close))
+        .route("/api/signals", get(signal_samples))
+        .route("/api/signals/scan", post(signal_scan))
         .route_layer(middleware::from_fn_with_state(token, require_local_token));
     Ok(Router::new()
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
@@ -90,6 +94,7 @@ pub fn router(
             research,
             holders,
             trader,
+            signals,
         }))
 }
 
@@ -706,6 +711,52 @@ async fn trading_close(
     trading_response(trader.close(&id).await)
 }
 
+#[derive(Deserialize)]
+struct SignalQuery {
+    source: Option<String>,
+}
+
+async fn signal_samples(State(state): State<Service>, Query(query): Query<SignalQuery>) -> Response {
+    let Some(signals) = state.signals else {
+        return no_store(error(StatusCode::FORBIDDEN, "信号统计仅在本地设置模式下可用。"));
+    };
+    let source = match query.source.as_deref() {
+        None | Some("live") => "live",
+        Some("scan") => "scan",
+        Some(_) => return no_store(error(StatusCode::BAD_REQUEST, "样本来源只能是 live 或 scan。")),
+    };
+    match signals.snapshot(source).await {
+        Ok(snapshot) => no_store(Json(snapshot).into_response()),
+        Err(message) => no_store(error(StatusCode::SERVICE_UNAVAILABLE, &message)),
+    }
+}
+
+async fn signal_scan(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(signals) = state.signals else {
+        return no_store(error(StatusCode::FORBIDDEN, "信号统计仅在本地设置模式下可用。"));
+    };
+    if !has_json(&headers) {
+        return no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的扫描参数。"));
+    }
+    if body_too_large(&body) {
+        return no_store(error(StatusCode::PAYLOAD_TOO_LARGE, "请求体过大。"));
+    }
+    let Some(params) = body
+        .ok()
+        .and_then(|Json(value)| serde_json::from_value::<crate::signals::ScanParams>(value).ok())
+    else {
+        return no_store(error(StatusCode::BAD_REQUEST, "请检查扫描天数、合约数、涨跌幅和时间窗口。"));
+    };
+    match signals.start_scan(params).await {
+        Ok(scan) => no_store(Json(json!({"scan": scan})).into_response()),
+        Err(message) => no_store(error(StatusCode::UNPROCESSABLE_ENTITY, &message)),
+    }
+}
+
 fn trading_response(result: Result<Value, String>) -> Response {
     match result {
         Ok(trade) => no_store(Json(json!({"trade": trade})).into_response()),
@@ -785,6 +836,7 @@ mod tests {
             None,
             Arc::new(Notifier::new(false).unwrap()),
             None,
+            None,
             Some(token.clone()),
         )
         .unwrap();
@@ -816,6 +868,8 @@ mod tests {
             ("/api/trading/account", Method::PUT),
             ("/api/trading/test-order", Method::POST),
             ("/api/trading/close", Method::POST),
+            ("/api/signals", Method::GET),
+            ("/api/signals/scan", Method::POST),
         ] {
             assert_eq!(
                 call(path, method, None, None).await.unwrap().status(),

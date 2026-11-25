@@ -6,6 +6,7 @@ mod monitor;
 mod notifications;
 mod research;
 mod routes;
+mod signals;
 mod store;
 mod strategy;
 mod test_strategy;
@@ -61,9 +62,15 @@ async fn main() -> store::Result<()> {
             Arc::clone(&binance),
         ))
     });
-    let app = routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), token)?;
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    // Signal statistics read alerts from the local database and evaluate them later.
+    let signals = store
+        .as_ref()
+        .map(|store| signals::Signals::new(Arc::clone(store), stopped.clone()).map(Arc::new))
+        .transpose()?;
+    let app = routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), token)?;
     let trading = trader.map(|trader| tokio::spawn(trading::supervise(trader, stopped.clone())));
+    let evaluating = signals.map(|signals| tokio::spawn(signals::supervise(signals, stopped.clone())));
     let worker = store.as_ref().map(|store| {
         tokio::spawn(monitor::supervise(
             Arc::clone(store),
@@ -87,6 +94,9 @@ async fn main() -> store::Result<()> {
     }
     if let Some(trading) = trading {
         trading.await?;
+    }
+    if let Some(evaluating) = evaluating {
+        evaluating.await?;
     }
     served?;
     Ok(())
