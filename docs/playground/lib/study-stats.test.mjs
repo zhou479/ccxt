@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { COST_TIERS } from "./signal-stats.ts";
 import {
-  HYPOTHESES, ROUND_GAP_MS, STUDY_COST_TIERS, STUDY_MIN_EVENTS, planLabel, prepareStudy, studyCost, studyGroupStats, studyStats, studyTrades,
+  HYPOTHESES, ROUND_GAP_MS, STUDY_COST_TIERS, STUDY_MIN_EVENTS, planLabel, prepareStudy, studyCost, studyGroupStats, studyStats, studySummary,
+  studyTrades,
 } from "./study-stats.ts";
 
 const HOUR = 3_600_000;
@@ -78,4 +79,17 @@ test("groups split the trades, and plan labels read in Chinese", () => {
   assert.deepEqual(studyGroupStats(rows, hypothesis("F1"), 0, "rate").map(({ bucket }) => bucket).sort(), ["0.2–0.3%", "≥0.5%"].sort());
   assert.equal(planLabel({ kind: "normal", hold: 72, stop: 8 }), "费率恢复正常就平，最多 3 天 · 止损 8%");
   assert.equal(planLabel({ kind: "fixed", hold: 8, stop: null }), "固定持仓 8 小时 · 不设止损");
+});
+
+test("the summary counts passed hypotheses and names the best one", () => {
+  const steady = Array.from({ length: STUDY_MIN_EVENTS + 10 }, (_, index) => sample({
+    id: `s${index}`, symbol: `S${index}`, time: index * 10 * HOUR, features: { regime: ["bull", "bear", "range"][index % 3] },
+  }, { exit: "normal", hours: 8, price: index % 4 === 0 ? -1 : 1, funding: 0.2 }));
+  const summary = studySummary(steady, 0, 100);
+  // 负费率样本：F1 做多通过；F3 顺着做做空，亏的是镜像。
+  assert.equal(summary.signals, steady.length);
+  assert.equal(summary.total, HYPOTHESES.length);
+  assert.equal(summary.passed, 1);
+  assert.equal(summary.best.id, "F1");
+  assert.equal(studySummary([], 0, 0).passed, 0);
 });

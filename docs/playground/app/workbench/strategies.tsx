@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { BackgroundMonitorStatus, BackgroundRule } from "@/lib/background-monitor-types";
 import { STRATEGY_KIND_LABELS, type StrategyCard } from "@/lib/strategy-list";
+import FundingStudy from "../markets/funding-study";
 import MarketMonitor from "../markets/market-monitor";
 import SignalStats from "../markets/signal-stats";
 import styles from "./workbench.module.css";
@@ -19,8 +20,9 @@ function StrategyDetail({ strategy, section }: { strategy: string; section: stri
   if (strategy === "spike-monitor") {
     if (section === "settings") return <MarketMonitor section="strategy" contracts={undefined} coinCount={null} directoryError={false} />;
     if (section === "records") return <MarketMonitor section="records" contracts={undefined} coinCount={null} directoryError={false} />;
-    if (section === "signals") return <SignalStats />;
+    if (section === "signals") return <SignalStats defaultOpen />;
   }
+  if (strategy === "funding-rate" && section === "study") return <FundingStudy withDataset={false} defaultOpen />;
   return null;
 }
 
@@ -96,7 +98,7 @@ export default function Strategies({ cards, monitor, blocked, onOpenSettings }: 
       </section>}
       <p className={styles.hint}>
         停止策略只是不再开新仓或不再告警，已有仓位继续由止损止盈和最长持仓时间管理；需要马上平掉全部仓位，请用总览页的「一键全平」。
-        以后新增的自动交易策略（例如资金费率、网格）通过历史检验后会出现在这里。
+        每个策略都有自己的卡片，没通过历史检验的交易策略不能启用；以后的趋势、网格等策略也会加在这里。
       </p>
     </>
   );

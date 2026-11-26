@@ -51,7 +51,8 @@ function archiveStatus(archive: ArchiveStatus) {
     `本地缓存 ${archive.cachedBars.toLocaleString("zh-CN")} 根 1 分钟K线。`;
 }
 
-export default function SignalStats() {
+/** 异动追单的历史检验。`defaultOpen` 为 true 时默认展开（工作台策略详情里）。 */
+export default function SignalStats({ defaultOpen = false }: { defaultOpen?: boolean }) {
   const [source, setSource] = useState<SignalSource>("scan");
   const { mode, data, error, startScan } = useSignals(source);
   const [filter, setFilter] = useState<SampleFilter>({
@@ -102,7 +103,7 @@ export default function SignalStats() {
   </td>;
 
   return (
-    <details className={styles.monitorFeature}>
+    <details className={styles.monitorFeature} open={defaultOpen || undefined}>
       <summary className={styles.monitorSummary}>
         <h3>信号效果统计 <small>{data ? `${samples.length} 个样本` : mode === "unavailable" ? "仅本机可用" : "读取中"}</small></h3>
       </summary>

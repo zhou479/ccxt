@@ -1,10 +1,12 @@
 /**
  * 工作台「策略」页的策略列表：把各个策略的状态整理成统一的卡片数据。
  *
- * 现在只有异动监控策略（只告警）和测试策略（手动下单）。以后新增的自动交易策略，在这里加一项即可出现在策略页；
- * 等有了第二个真正的交易策略，再把启停和状态统一挪到后端。
+ * 不管有没有通过历史检验，每个策略都有自己的卡片，它的参数、记录和检验结果都放在卡片详情里。
+ * 现在有异动监控策略（只告警）、资金费率策略（未通过检验）和测试策略（手动下单）。
+ * 等有了第一个通过检验、真正运行的交易策略，再把启停和状态统一挪到后端。
  */
 import type { BackgroundMonitorStatus } from "./background-monitor-types";
+import type { StudySummary } from "./study-stats";
 import type { Trade } from "./trading-types";
 
 const HOUR = 3_600_000;
@@ -70,12 +72,52 @@ export function spikeMonitorCard(monitor: BackgroundMonitorStatus | null, now: n
     ],
     toggleable: true,
     // 30 天、959 个独立事件的检验：追进去和反着做扣成本后都亏，所以只告警、不下单。
-    verdict: { passed: false, text: "信号统计：追进去扣成本后亏损，因此只告警、不自动下单" },
+    verdict: { passed: false, text: "异动追单未通过历史检验（追进去和反着做扣成本后都亏），只用来告警" },
     details: [
       { id: "settings", label: "参数设置" },
       { id: "records", label: "异动记录" },
       { id: "signals", label: "信号统计" },
     ],
+  };
+}
+
+function day(time: number) {
+  return new Date(time + BEIJING_OFFSET).toISOString().slice(0, 10);
+}
+
+function signedPercent(value: number | null) {
+  return value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+/**
+ * 资金费率策略：费率从常态变成极端时做多或做空。只有历史检验通过后才会实现自动下单，所以现在没有启停。
+ * `summary` 是最近一次检验的摘要，`studying` 表示检验正在进行。
+ */
+export function fundingStrategyCard(summary: StudySummary | null, studying: boolean): StrategyCard {
+  const passed = (summary?.passed ?? 0) > 0;
+  const status = studying ? "正在运行历史检验…"
+    : !summary ? "还没有检验结果，打开详情运行历史检验"
+    : passed ? `${summary.passed} 个假设通过历史检验，写成规则后可以上模拟盘`
+    : "未通过历史检验，不能启用";
+  return {
+    id: "funding-rate",
+    name: "资金费率策略",
+    kind: "trading",
+    running: false,
+    status,
+    warning: false,
+    stats: summary ? [
+      { label: "检验区间", value: `${day(summary.from)} 至 ${day(summary.to)}` },
+      { label: "信号", value: `${summary.signals} 个` },
+      { label: "通过", value: `${summary.passed} / ${summary.total}` },
+      { label: "最好", value: `${summary.best.id} 每笔 ${signedPercent(summary.best.average)}` },
+    ] : [],
+    toggleable: false,
+    verdict: summary ? {
+      passed,
+      text: passed ? `历史检验：${summary.passed} / ${summary.total} 个假设通过` : `历史检验：${summary.total} 个假设全部未通过，扣成本并计入资金费后都亏`,
+    } : null,
+    details: [{ id: "study", label: "历史检验" }],
   };
 }
 
@@ -101,8 +143,13 @@ export function testStrategyCard(trades: readonly Trade[], now: number): Strateg
   };
 }
 
-export function strategyCards(monitor: BackgroundMonitorStatus | null, trades: readonly Trade[], now: number): StrategyCard[] {
-  return [spikeMonitorCard(monitor, now), testStrategyCard(trades, now)];
+export function strategyCards(
+  monitor: BackgroundMonitorStatus | null,
+  trades: readonly Trade[],
+  now: number,
+  funding: { summary: StudySummary | null; studying: boolean } = { summary: null, studying: false },
+): StrategyCard[] {
+  return [spikeMonitorCard(monitor, now), fundingStrategyCard(funding.summary, funding.studying), testStrategyCard(trades, now)];
 }
 
 /** 总览顶部的一句话：哪些策略在运行。 */

@@ -2,13 +2,13 @@
 
 import { useState } from "react";
 import CoinResearch from "../markets/coin-research";
-import FundingStudy from "../markets/funding-study";
+import { DatasetPanel } from "../markets/funding-study";
 import { useMarketDirectory } from "../markets/use-market-directory";
 import styles from "./workbench.module.css";
 
 const SECTIONS = [
   { id: "market", label: "行情查询" },
-  { id: "study", label: "策略检验" },
+  { id: "data", label: "研究数据" },
 ] as const;
 
 type Section = (typeof SECTIONS)[number]["id"];
@@ -21,8 +21,8 @@ function MarketLookup() {
 }
 
 /**
- * 研究页：不属于某个策略的通用工具——看行情、检验新的策略想法。
- * 某个策略自己的记录和检验结果（例如异动监控的异动记录、信号统计）放在策略页它的卡片详情里。
+ * 研究页：不属于某个策略的通用工具——看行情、准备历史检验用的研究数据。
+ * 每个策略自己的记录和检验结果（异动监控的信号统计、资金费率的历史检验）放在策略页它的卡片详情里。
  */
 export default function Research() {
   const [section, setSection] = useState<Section>("market");
@@ -35,7 +35,7 @@ export default function Research() {
         ))}
       </div>
       {section === "market" && <MarketLookup />}
-      {section === "study" && <FundingStudy />}
+      {section === "data" && <DatasetPanel />}
     </>
   );
 }

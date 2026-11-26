@@ -154,6 +154,30 @@ export function studyStats(trades: readonly StudyTrade[]): StudyStats {
   };
 }
 
+/** 策略卡片上的检验摘要：按主判据，几个假设、几个通过，以及每笔平均最好的那个。 */
+export type StudySummary = {
+  signals: number;
+  from: number;
+  to: number;
+  passed: number;
+  total: number;
+  best: { id: string; average: number | null };
+};
+
+export function studySummary(samples: readonly FundingSample[], from: number, to: number): StudySummary {
+  const rows = prepareStudy(samples);
+  const results = HYPOTHESES.map((hypothesis) => ({ id: hypothesis.id, stats: studyStats(studyTrades(rows, hypothesis, PRIMARY_PLAN)) }));
+  const best = results.reduce((top, one) => ((one.stats.average ?? -Infinity) > (top.stats.average ?? -Infinity) ? one : top));
+  return {
+    signals: rows.length,
+    from,
+    to,
+    passed: results.filter(({ stats }) => stats.credible).length,
+    total: results.length,
+    best: { id: best.id, average: best.stats.average },
+  };
+}
+
 export function planLabel({ kind, hold, stop }: StudyPlan): string {
   const time = hold % 24 === 0 ? `${hold / 24} 天` : `${hold} 小时`;
   const exit = kind === "normal" ? `费率恢复正常就平，最多 ${time}` : `固定持仓 ${time}`;

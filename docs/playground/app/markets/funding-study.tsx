@@ -89,9 +89,65 @@ const statsHeader = <>
   <th scope="col">最大回撤 / 累计</th>
 </>;
 
-export default function FundingStudy() {
-  const { mode, dataset, study, error, prepare, run } = useStudy();
+/** 研究数据：下载两年的小时K线和资金费率（含已下架合约），资金费率、趋势等中低频策略的检验共用。 */
+export function DatasetSection({ dataset, prepare, from }: {
+  dataset: DatasetSnapshot | null;
+  prepare: (days: number) => Promise<void>;
+  /** 只统计这个时间之后的行情阶段天数（例如检验区间的起点）。 */
+  from?: number;
+}) {
   const [datasetDays, setDatasetDays] = useState("730");
+  const [message, setMessage] = useState("");
+  const downloading = dataset?.job.status === "running";
+  const covered = dataset ? regimeDays(dataset.regimes, from) : null;
+
+  async function download(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const days = Math.trunc(Number(datasetDays));
+    if (!window.confirm(`下载最近 ${days} 天的研究数据？包括所有加密永续合约（含已下架）的小时K线和资金费率。` +
+      "第一次大约需要 1–2 小时，之后只补缺的部分。下载期间页面行情不受影响。")) return;
+    setMessage("");
+    try {
+      await prepare(days);
+    } catch (caught) {
+      setMessage(caught instanceof Error ? caught.message : "无法开始下载研究数据。");
+    }
+  }
+
+  return <>
+    <h4>研究数据</h4>
+    <form className={styles.monitorForm} onSubmit={download}>
+      <label htmlFor="dataset-days">最近</label>
+      <input id="dataset-days" type="number" min={30} max={1095} required value={datasetDays} disabled={downloading}
+        onChange={(event) => setDatasetDays(event.target.value)} />天
+      <button type="submit" disabled={downloading}>{downloading ? "下载中…" : "下载 / 更新研究数据"}</button>
+    </form>
+    {dataset && <p role="status">{datasetStatus(dataset)}</p>}
+    {dataset?.job.archiveError && <p role="alert">{dataset.job.archiveError}</p>}
+    {message && <p role="alert">{message}</p>}
+    {covered && dataset && dataset.regimes.length > 0 && <p>
+      行情阶段（按 BTC 日收盘价与 200 日均线，次日生效）：牛市 {covered.bull} 天、熊市 {covered.bear} 天、震荡 {covered.range} 天
+      {from ? "（检验区间内）" : ""}。
+    </p>}
+  </>;
+}
+
+/** 工作台「研究 → 研究数据」：单独显示研究数据的下载和状态。 */
+export function DatasetPanel() {
+  const { mode, dataset, error, prepare } = useStudy();
+  return (
+    <section className={`${styles.result} ${styles.monitorSettings} ${styles.signalStats}`} aria-label="研究数据">
+      <p>中低频策略（资金费率、趋势等）的历史检验都用这批数据：所有加密永续合约（含已下架）的小时K线和资金费率。</p>
+      {mode === "unavailable" && <p role="status">请在运行 Playground 的电脑上打开本机页面。</p>}
+      {error && <p role="alert">{error}</p>}
+      {mode === "local" && <DatasetSection dataset={dataset} prepare={prepare} />}
+    </section>
+  );
+}
+
+/** 资金费率策略的历史检验。`withDataset` 为 false 时不显示研究数据的下载（工作台把它放在研究页）。 */
+export default function FundingStudy({ withDataset = true, defaultOpen = false }: { withDataset?: boolean; defaultOpen?: boolean }) {
+  const { mode, dataset, study, error, prepare, run } = useStudy();
   const [form, setForm] = useState({ days: "730", top: "100" });
   const [plan, setPlan] = useState(PRIMARY_PLAN);
   const [hypothesisId, setHypothesisId] = useState("F1");
@@ -110,20 +166,7 @@ export default function FundingStudy() {
   const split = samples.find(({ half }) => half === 1)?.time;
   const downloading = dataset?.job.status === "running";
   const studying = study?.status === "running";
-  const covered = dataset ? regimeDays(dataset.regimes, result?.from) : null;
-
-  async function download(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const days = Math.trunc(Number(datasetDays));
-    if (!window.confirm(`下载最近 ${days} 天的研究数据？包括所有加密永续合约（含已下架）的小时K线和资金费率。` +
-      "第一次大约需要 1–2 小时，之后只补缺的部分。下载期间页面行情不受影响。")) return;
-    setMessage("");
-    try {
-      await prepare(days);
-    } catch (caught) {
-      setMessage(caught instanceof Error ? caught.message : "无法开始下载研究数据。");
-    }
-  }
+  const hasData = (dataset?.summary?.hourBars ?? 0) > 0;
 
   async function start(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -136,9 +179,9 @@ export default function FundingStudy() {
   }
 
   return (
-    <details className={styles.monitorFeature}>
+    <details className={styles.monitorFeature} open={defaultOpen || undefined}>
       <summary className={styles.monitorSummary}>
-        <h3>中低频策略检验 <small>{result ? `资金费率 · ${samples.length} 个信号` : mode === "unavailable" ? "仅本机可用" : "资金费率"}</small></h3>
+        <h3>资金费率策略 · 历史检验 <small>{result ? `资金费率 · ${samples.length} 个信号` : mode === "unavailable" ? "仅本机可用" : "资金费率"}</small></h3>
       </summary>
       <div className={`${styles.monitorBody} ${styles.turnover} ${styles.signalStats}`}>
         <p>检验持仓几小时到几天的策略。当前检验「资金费率极端值」：某个合约的资金费率从常态变成极端时，
@@ -146,19 +189,8 @@ export default function FundingStudy() {
         {mode === "unavailable" && <p role="status">请在运行 Playground 的电脑上打开本机行情页查看。</p>}
         {error && <p role="alert">{error}</p>}
         {mode === "local" && <>
-          <h4>研究数据</h4>
-          <form className={styles.monitorForm} onSubmit={download}>
-            <label htmlFor="dataset-days">最近</label>
-            <input id="dataset-days" type="number" min={30} max={1095} required value={datasetDays} disabled={downloading}
-              onChange={(event) => setDatasetDays(event.target.value)} />天
-            <button type="submit" disabled={downloading}>{downloading ? "下载中…" : "下载 / 更新研究数据"}</button>
-          </form>
-          {dataset && <p role="status">{datasetStatus(dataset)}</p>}
-          {dataset?.job.archiveError && <p role="alert">{dataset.job.archiveError}</p>}
-          {covered && dataset && dataset.regimes.length > 0 && <p>
-            行情阶段（按 BTC 日收盘价与 200 日均线，次日生效）：牛市 {covered.bull} 天、熊市 {covered.bear} 天、震荡 {covered.range} 天
-            {result ? "（检验区间内）" : ""}。
-          </p>}
+          {withDataset ? <DatasetSection dataset={dataset} prepare={prepare} from={result?.from} />
+            : !hasData && <p role="status">还没有研究数据，请先到「研究 → 研究数据」下载。</p>}
 
           <h4>资金费率检验</h4>
           <form className={styles.monitorForm} onSubmit={start}>

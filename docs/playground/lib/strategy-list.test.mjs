@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { beijingDayStart, runningSummary, spikeMonitorCard, strategyCards, testStrategyCard } from "./strategy-list.ts";
+import { beijingDayStart, fundingStrategyCard, runningSummary, spikeMonitorCard, strategyCards, testStrategyCard } from "./strategy-list.ts";
 
 const HOUR = 3_600_000;
 const now = 1_795_600_000_000;
@@ -64,4 +64,20 @@ test("the test strategy has no switch and counts its own trades", () => {
   assert.deepEqual(card.stats.map(({ value }) => value), ["1", "1"]);
   assert.deepEqual(runningSummary(strategyCards(monitor(), trades, now)), { running: 1, text: "异动监控策略运行中" });
   assert.deepEqual(runningSummary(strategyCards(null, [], now)), { running: 0, text: "暂无运行中的策略" });
+});
+
+test("the funding strategy shows its study verdict and cannot be started before passing", () => {
+  const empty = fundingStrategyCard(null, false);
+  assert.equal(empty.status, "还没有检验结果，打开详情运行历史检验");
+  assert.equal(empty.toggleable, false);
+  assert.deepEqual(empty.details, [{ id: "study", label: "历史检验" }]);
+  const failed = fundingStrategyCard({ signals: 3079, from: today - 730 * 24 * HOUR, to: today, passed: 0, total: 4,
+    best: { id: "F1", average: -0.0856 } }, false);
+  assert.equal(failed.status, "未通过历史检验，不能启用");
+  assert.equal(failed.verdict.passed, false);
+  assert.deepEqual(failed.stats.slice(1).map(({ value }) => value), ["3079 个", "0 / 4", "F1 每笔 -0.09%"]);
+  assert.equal(fundingStrategyCard(null, true).status, "正在运行历史检验…");
+  assert.equal(strategyCards(null, [], now).map(({ id }) => id).join(), "spike-monitor,funding-rate,test");
+  // 未通过的交易策略不算在运行中。
+  assert.equal(runningSummary(strategyCards(null, [], now)).running, 0);
 });
