@@ -4,13 +4,18 @@ type RustMarketRoute = "/api/markets/contracts" | "/api/markets/alert-context" |
   "/api/markets/background-monitor" | "/api/strategy-notifications" | "/api/markets/directory" |
   "/api/markets/ticker" | "/api/markets/order-book" | "/api/markets/funding-rates" | "/api/markets/liquidations" |
   "/api/markets/volume" | "/api/markets/contract-market-caps" | "/api/markets/fundamentals" | "/api/markets/holders" |
-  TradingRoute | SignalRoute;
+  TradingRoute | SignalRoute | DatasetRoute;
+type StudyRoute = "/api/study" | "/api/study/run";
 type SignalRoute = "/api/signals" | "/api/signals/scan";
-type TradingRoute = "/api/trading" | "/api/trading/account" | "/api/trading/test-order" | "/api/trading/close";
+type DatasetRoute = "/api/dataset" | "/api/dataset/prepare" | StudyRoute;
+type TradingRoute = "/api/trading" | "/api/trading/account" | "/api/trading/test-order" | "/api/trading/close" |
+  "/api/trading/close-all" | "/api/trading/resume" | "/api/trading/overview";
 const localRoutes = new Set<RustMarketRoute>([
   "/api/markets/background-monitor", "/api/strategy-notifications",
   "/api/trading", "/api/trading/account", "/api/trading/test-order", "/api/trading/close",
-  "/api/signals", "/api/signals/scan",
+  "/api/trading/close-all", "/api/trading/resume", "/api/trading/overview",
+  "/api/signals", "/api/signals/scan", "/api/dataset", "/api/dataset/prepare",
+  "/api/study", "/api/study/run",
 ]);
 
 const loopbackAgent = new Agent();

@@ -1,5 +1,6 @@
 mod archive;
 mod binance;
+mod dataset;
 mod history;
 mod holders;
 mod liquidation;
@@ -11,6 +12,7 @@ mod routes;
 mod signals;
 mod store;
 mod strategy;
+mod study;
 mod test_strategy;
 mod tokenomics;
 mod trading;
@@ -62,6 +64,7 @@ async fn main() -> store::Result<()> {
             settings,
             Arc::clone(store),
             Arc::clone(&binance),
+            Arc::clone(&notifier),
         ))
     });
     let (stop, stopped) = tokio::sync::watch::channel(false);
@@ -75,11 +78,17 @@ async fn main() -> store::Result<()> {
         .zip(history.as_ref())
         .map(|(store, history)| signals::Signals::new(Arc::clone(store), Arc::clone(history), stopped.clone()).map(Arc::new))
         .transpose()?;
+    // Hourly bars and funding for testing slower strategies, including delisted contracts.
+    let dataset = history
+        .as_ref()
+        .map(|history| dataset::Dataset::new(Arc::clone(history), stopped.clone()).map(Arc::new))
+        .transpose()?;
+    let study = history.as_ref().map(|history| Arc::new(study::Study::new(Arc::clone(history), stopped.clone())));
     // Data Binance keeps only briefly (or never) is archived for later factor research.
     let archiving = history
         .filter(|_| archive::enabled())
         .map(|history| tokio::spawn(archive::supervise(history, stopped.clone())));
-    let app = routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), token)?;
+    let app = routes::router(binance.clone(), store.clone(), notifier.clone(), trader.clone(), signals.clone(), dataset, study, token)?;
     let trading = trader.map(|trader| tokio::spawn(trading::supervise(trader, stopped.clone())));
     let evaluating = signals.map(|signals| tokio::spawn(signals::supervise(signals, stopped.clone())));
     let worker = store.as_ref().map(|store| {

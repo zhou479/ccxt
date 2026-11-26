@@ -30,6 +30,11 @@ pub struct Message {
 }
 
 impl Message {
+    /// 系统提醒（交易保护、对账），`id` 相同的消息短时间内只发一次。
+    pub fn alert(title: &str, lines: Vec<String>, id: String) -> Self {
+        Self { title: title.to_owned(), lines, id: Some(id) }
+    }
+
     fn text(&self) -> String {
         format!("{}\n{}", self.title, self.lines.join("\n"))
     }

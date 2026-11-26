@@ -88,5 +88,11 @@ export function useTrading() {
       setError("");
     }), [run]);
 
-  return { mode, data, error, placeTestOrder, closeTrade, deleteTrades, changeAccount };
+  const closeAll = useCallback((accountRevision: string) =>
+    run(() => update<{ closed: number; failed: { symbol: string; error: string }[] }>(
+      "/api/trading/close-all", "POST", { accountRevision }, "一键全平失败。")), [run]);
+  const resume = useCallback((accountRevision: string) =>
+    run(() => update("/api/trading/resume", "POST", { accountRevision }, "无法恢复开仓。")), [run]);
+
+  return { mode, data, error, placeTestOrder, closeTrade, deleteTrades, changeAccount, closeAll, resume };
 }

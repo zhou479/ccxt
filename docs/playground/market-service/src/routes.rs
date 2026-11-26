@@ -33,6 +33,8 @@ struct Service {
     holders: Arc<crate::holders::Holders>,
     trader: Option<Arc<Trader>>,
     signals: Option<Arc<crate::signals::Signals>>,
+    dataset: Option<Arc<crate::dataset::Dataset>>,
+    study: Option<Arc<crate::study::Study>>,
 }
 
 pub fn router(
@@ -41,6 +43,8 @@ pub fn router(
     notifier: Arc<Notifier>,
     trader: Option<Arc<Trader>>,
     signals: Option<Arc<crate::signals::Signals>>,
+    dataset: Option<Arc<crate::dataset::Dataset>>,
+    study: Option<Arc<crate::study::Study>>,
     token: Option<Arc<str>>,
 ) -> crate::store::Result<Router> {
     let markets = Arc::new(Markets::new(Arc::clone(&binance))?);
@@ -68,8 +72,15 @@ pub fn router(
         .route("/api/trading/account", axum::routing::put(trading_account))
         .route("/api/trading/test-order", post(trading_test_order))
         .route("/api/trading/close", post(trading_close))
+        .route("/api/trading/overview", get(trading_overview))
+        .route("/api/trading/close-all", post(trading_close_all))
+        .route("/api/trading/resume", post(trading_resume))
         .route("/api/signals", get(signal_samples))
         .route("/api/signals/scan", post(signal_scan))
+        .route("/api/dataset", get(dataset_status))
+        .route("/api/dataset/prepare", post(dataset_prepare))
+        .route("/api/study", get(study_status))
+        .route("/api/study/run", post(study_run))
         .route_layer(middleware::from_fn_with_state(token, require_local_token));
     Ok(Router::new()
         .route("/health", get(|| async { StatusCode::NO_CONTENT }))
@@ -95,6 +106,8 @@ pub fn router(
             holders,
             trader,
             signals,
+            dataset,
+            study,
         }))
 }
 
@@ -711,6 +724,58 @@ async fn trading_close(
     trading_response(trader.close(&id).await)
 }
 
+async fn trading_overview(State(state): State<Service>) -> Response {
+    let Some(trader) = state.trader else {
+        return no_store(error(StatusCode::FORBIDDEN, "下单仅在本地设置模式下可用。"));
+    };
+    no_store(Json(trader.overview().await).into_response())
+}
+
+/// 一键全平和恢复开仓都要带上当前账号版本，防止对着已经换掉的账号操作。
+fn guard_revision(headers: &HeaderMap, body: Result<Json<Value>, JsonRejection>) -> Result<uuid::Uuid, Response> {
+    if !has_json(headers) {
+        return Err(no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的请求。")));
+    }
+    body.ok()
+        .and_then(|Json(value)| value["accountRevision"].as_str().and_then(|text| uuid::Uuid::parse_str(text).ok()))
+        .ok_or_else(|| no_store(error(StatusCode::BAD_REQUEST, "请刷新页面并重新确认当前账号。")))
+}
+
+async fn trading_close_all(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(trader) = state.trader else {
+        return no_store(error(StatusCode::FORBIDDEN, "下单仅在本地设置模式下可用。"));
+    };
+    match guard_revision(&headers, body) {
+        Ok(revision) => guard_response(trader.close_all(revision).await),
+        Err(response) => response,
+    }
+}
+
+async fn trading_resume(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(trader) = state.trader else {
+        return no_store(error(StatusCode::FORBIDDEN, "下单仅在本地设置模式下可用。"));
+    };
+    match guard_revision(&headers, body) {
+        Ok(revision) => guard_response(trader.resume(revision).await),
+        Err(response) => response,
+    }
+}
+
+fn guard_response(result: Result<Value, String>) -> Response {
+    match result {
+        Ok(value) => no_store(Json(value).into_response()),
+        Err(message) => no_store(error(StatusCode::CONFLICT, &message)),
+    }
+}
+
 #[derive(Deserialize)]
 struct SignalQuery {
     source: Option<String>,
@@ -753,6 +818,75 @@ async fn signal_scan(
     };
     match signals.start_scan(params).await {
         Ok(scan) => no_store(Json(json!({"scan": scan})).into_response()),
+        Err(message) => no_store(error(StatusCode::UNPROCESSABLE_ENTITY, &message)),
+    }
+}
+
+async fn dataset_status(State(state): State<Service>) -> Response {
+    let Some(dataset) = state.dataset else {
+        return no_store(error(StatusCode::FORBIDDEN, "研究数据集仅在本地设置模式下可用。"));
+    };
+    match dataset.snapshot().await {
+        Ok(snapshot) => no_store(Json(snapshot).into_response()),
+        Err(message) => no_store(error(StatusCode::SERVICE_UNAVAILABLE, &message)),
+    }
+}
+
+async fn dataset_prepare(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(dataset) = state.dataset else {
+        return no_store(error(StatusCode::FORBIDDEN, "研究数据集仅在本地设置模式下可用。"));
+    };
+    if !has_json(&headers) {
+        return no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的参数。"));
+    }
+    if body_too_large(&body) {
+        return no_store(error(StatusCode::PAYLOAD_TOO_LARGE, "请求体过大。"));
+    }
+    let Some(params) = body
+        .ok()
+        .and_then(|Json(value)| serde_json::from_value::<crate::dataset::PrepareParams>(value).ok())
+    else {
+        return no_store(error(StatusCode::BAD_REQUEST, "请检查数据天数。"));
+    };
+    match dataset.start(params).await {
+        Ok(job) => no_store(Json(json!({"job": job})).into_response()),
+        Err(message) => no_store(error(StatusCode::UNPROCESSABLE_ENTITY, &message)),
+    }
+}
+
+async fn study_status(State(state): State<Service>) -> Response {
+    let Some(study) = state.study else {
+        return no_store(error(StatusCode::FORBIDDEN, "策略检验仅在本地设置模式下可用。"));
+    };
+    no_store(Json(study.snapshot().await).into_response())
+}
+
+async fn study_run(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(study) = state.study else {
+        return no_store(error(StatusCode::FORBIDDEN, "策略检验仅在本地设置模式下可用。"));
+    };
+    if !has_json(&headers) {
+        return no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的参数。"));
+    }
+    if body_too_large(&body) {
+        return no_store(error(StatusCode::PAYLOAD_TOO_LARGE, "请求体过大。"));
+    }
+    let Some(params) = body
+        .ok()
+        .and_then(|Json(value)| serde_json::from_value::<crate::study::StudyParams>(value).ok())
+    else {
+        return no_store(error(StatusCode::BAD_REQUEST, "请检查检验天数和流动性前 N 名。"));
+    };
+    match study.start(params).await {
+        Ok(job) => no_store(Json(job).into_response()),
         Err(message) => no_store(error(StatusCode::UNPROCESSABLE_ENTITY, &message)),
     }
 }
@@ -837,6 +971,8 @@ mod tests {
             Arc::new(Notifier::new(false).unwrap()),
             None,
             None,
+            None,
+            None,
             Some(token.clone()),
         )
         .unwrap();
@@ -869,7 +1005,14 @@ mod tests {
             ("/api/trading/test-order", Method::POST),
             ("/api/signals", Method::GET),
             ("/api/signals/scan", Method::POST),
+            ("/api/dataset", Method::GET),
+            ("/api/dataset/prepare", Method::POST),
+            ("/api/study", Method::GET),
+            ("/api/study/run", Method::POST),
             ("/api/trading/close", Method::POST),
+            ("/api/trading/overview", Method::GET),
+            ("/api/trading/close-all", Method::POST),
+            ("/api/trading/resume", Method::POST),
         ] {
             assert_eq!(
                 call(path, method, None, None).await.unwrap().status(),

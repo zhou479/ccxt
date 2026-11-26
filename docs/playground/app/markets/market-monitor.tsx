@@ -20,7 +20,9 @@ import { useStrategyNotifications } from "./use-strategy-notifications";
 import DingTalkSettings from "./dingtalk-settings";
 import BinanceSettings from "./binance-settings";
 import SignalStats from "./signal-stats";
+import FundingStudy from "./funding-study";
 import TestStrategy from "./test-strategy";
+import TradingGuard from "./trading-guard";
 import TradeRecords from "./trade-records";
 import { useTrading } from "./use-trading";
 import styles from "./markets.module.css";
@@ -51,10 +53,12 @@ function levelRecord(symbol: string, move: PriceAlertLevel, threshold: number, s
   };
 }
 
-export default function MarketMonitor({ contracts, coinCount, directoryError }: {
+export default function MarketMonitor({ contracts, coinCount, directoryError, section }: {
   contracts: readonly MarketInstrument[] | undefined;
   coinCount: number | null;
   directoryError: boolean;
+  /** 工作台只取其中一块：异动监控策略的设置，或者告警记录。不传时显示行情页的整个交易策略区域。 */
+  section?: "strategy" | "records";
 }) {
   const [enabled, setEnabled] = useState(false);
   const [upInput, setUpInput] = useState("5");
@@ -495,8 +499,10 @@ export default function MarketMonitor({ contracts, coinCount, directoryError }: 
     : !symbols ? "正在准备监控名单" : !hasSymbols ? "暂无可交易币种"
       : `${online ? "行情已连接" : "正在连接行情"} · 已收到 ${observedCoins} 个币种的行情`;
 
+  const records = <AlertRecords records={history} canDelete={recordsReady && canEdit} onDelete={deleteAlertRecords}
+    defaultOpen={section === "records"} />;
   const strategy = (
-    <details className={styles.monitorFeature}>
+    <details className={styles.monitorFeature} open={section === "strategy" || undefined}>
       <summary className={styles.monitorSummary}>
         <h3>异动监控策略 <small>{monitoringStatus}</small></h3>
       </summary>
@@ -573,10 +579,13 @@ export default function MarketMonitor({ contracts, coinCount, directoryError }: 
             ? "启用后自动启动独立进程，关闭网页后继续监控。"
             : background.mode === "browser" ? "请保持行情页打开。" : ""}</p>
         </section>
-        <AlertRecords records={history} canDelete={recordsReady && canEdit} onDelete={deleteAlertRecords} />
+        {!section && records}
       </div>
     </details>
   );
+
+  if (section === "strategy") return strategy;
+  if (section === "records") return records;
 
   return (
     <section id="market-alerts" className={styles.monitorPanel} aria-labelledby="market-alert-heading">
@@ -590,7 +599,9 @@ export default function MarketMonitor({ contracts, coinCount, directoryError }: 
       </details>
       {strategy}
       <SignalStats />
+      <FundingStudy />
       <TestStrategy mode={trading.mode} status={trading.data} error={trading.error} onSubmit={trading.placeTestOrder} />
+      <TradingGuard status={trading.data} onCloseAll={trading.closeAll} onResume={trading.resume} />
       <TradeRecords trades={trading.data?.trades ?? []} activeMode={trading.data?.enabled ? trading.data.mode : "off"}
         canDelete={trading.mode === "local"} onDelete={trading.deleteTrades} onClose={trading.closeTrade} />
     </section>

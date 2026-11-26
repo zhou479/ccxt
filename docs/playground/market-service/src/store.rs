@@ -106,6 +106,11 @@ impl Store {
         self.1.with_extension("binance-account.json")
     }
 
+    /// 一键全平后的「暂停开仓」状态。
+    pub fn trading_guard_path(&self) -> PathBuf {
+        self.1.with_extension("trading-guard.json")
+    }
+
     /// Local market history cache and archive, kept apart from the monitor database.
     pub fn history_path(&self) -> PathBuf {
         self.1.with_extension("history.sqlite")
@@ -362,6 +367,11 @@ impl Store {
             "SELECT data FROM trade WHERE status IN ('opening', 'open', 'closing') ORDER BY openedAt",
             [],
         )
+    }
+
+    /// `time` 之后开仓的交易，用于计算当天亏损。
+    pub fn trades_opened_since(&self, time: i64) -> Result<Vec<Value>> {
+        query_json(&*self.db()?, "SELECT data FROM trade WHERE openedAt >= ? ORDER BY openedAt", [time])
     }
 
     pub fn trade(&self, id: &str) -> Result<Option<Value>> {

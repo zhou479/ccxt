@@ -106,7 +106,7 @@ const SCAN_COOLDOWN: usize = 30;
 const KLINE_PAGE: usize = 1_500;
 const OPEN_INTEREST_PAGE: usize = 500;
 const FUNDING_PAGE: usize = 1_000;
-/// Klines and funding go back years; scans past the open interest window leave that feature empty.
+/// K线和资金费率可以拉很多年；超出持仓量保留期（约 30 天）的样本，持仓量变化留空。
 const MAX_SCAN_DAYS: i64 = 365;
 const TRADE_PAGE: usize = 1_000;
 const MAX_TRADE_PAGES: usize = 10;
@@ -863,14 +863,24 @@ impl Fetcher {
 
     /// One-minute bars in `[start, end)`, downloading only what the cache does not have yet.
     pub(crate) async fn cached_bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>, String> {
-        let end = end.min(now_ms().div_euclid(MINUTE) * MINUTE);
-        let coverage = self.history.coverage(symbol, Kind::Klines).map_err(cache_error)?;
-        for (from, to) in history::missing(coverage, start, fresh_end(coverage, end, FRESH_BARS)) {
-            let bars = self.minute_bars(symbol, from, to).await?;
-            self.history.save_bars(symbol, &bars).map_err(cache_error)?;
-            self.extend(symbol, Kind::Klines, from, to)?;
+        self.cached_candles(symbol, Kind::Klines, start, end).await
+    }
+
+    /// `[start, end)` 的 1 分钟或 1 小时K线，只下载本地缓存还没有的部分。
+    pub(crate) async fn cached_candles(&self, symbol: &str, kind: Kind, start: i64, end: i64) -> Result<Vec<Bar>, String> {
+        let (interval, length, fresh) = match kind {
+            Kind::Klines => ("1m", MINUTE, FRESH_BARS),
+            Kind::HourKlines => ("1h", HOUR, HOUR),
+            _ => return Err("只能缓存K线。".into()),
+        };
+        let end = end.min(now_ms().div_euclid(length) * length);
+        let coverage = self.history.coverage(symbol, kind).map_err(cache_error)?;
+        for (from, to) in history::missing(coverage, start, fresh_end(coverage, end, fresh)) {
+            let bars = self.candles(symbol, interval, length, from, to).await?;
+            self.history.save_candles(kind, symbol, &bars).map_err(cache_error)?;
+            self.extend(symbol, kind, from, to)?;
         }
-        self.history.bars(symbol, start, end).map_err(cache_error)
+        self.history.candles(kind, symbol, start, end).map_err(cache_error)
     }
 
     /// Open interest or funding in `[start, end]`, downloading only what the cache does not have yet.
@@ -888,7 +898,7 @@ impl Fetcher {
             let points = match kind {
                 Kind::OpenInterest => self.open_interest(symbol, from, to).await?,
                 Kind::Funding => self.funding(symbol, from, to).await?,
-                Kind::Klines => return Err("K线请使用 cached_bars。".into()),
+                Kind::Klines | Kind::HourKlines => return Err("K线请使用 cached_candles。".into()),
             };
             self.history.save_points(symbol, kind, &points).map_err(cache_error)?;
             self.extend(symbol, kind, from, to)?;
@@ -920,20 +930,25 @@ impl Fetcher {
 
     /// Finished one-minute bars in `[start, end)`.
     pub(crate) async fn minute_bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>, String> {
+        self.candles(symbol, "1m", MINUTE, start, end).await
+    }
+
+    /// `[start, end)` 内已收盘、每根 `length` 毫秒的K线。
+    async fn candles(&self, symbol: &str, interval: &str, length: i64, start: i64, end: i64) -> Result<Vec<Bar>, String> {
         let end = end.min(now_ms());
         let mut bars: Vec<Bar> = Vec::new();
         let mut cursor = start;
         while cursor < end {
             let rows: Vec<Vec<Value>> = self
                 .get(Endpoint::Klines, json!({
-                    "symbol": symbol, "interval": "1m", "startTime": cursor, "endTime": end - 1, "limit": KLINE_PAGE,
+                    "symbol": symbol, "interval": interval, "startTime": cursor, "endTime": end - 1, "limit": KLINE_PAGE,
                 }))
                 .await?;
-            let page = parse_bars(&rows, 1);
+            let page = parse_bars(&rows, length / MINUTE);
             let Some(last) = page.last() else {
                 break;
             };
-            cursor = last.time + MINUTE;
+            cursor = last.time + length;
             bars.extend(page);
             if rows.len() < KLINE_PAGE {
                 break;
@@ -981,7 +996,7 @@ impl Fetcher {
         Ok(open_interest_points(&rows))
     }
 
-    /// Settled funding in `[start, end]`, oldest first; hourly-funded contracts need several pages.
+    /// `[start, end]` 的资金费结算记录，按时间从早到晚；每小时结算的合约需要分多页下载。
     pub(crate) async fn funding(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<(i64, f64)>, String> {
         let mut points = Vec::new();
         let mut cursor = start;

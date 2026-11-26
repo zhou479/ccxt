@@ -9,8 +9,11 @@
 //! - `demo`：币安模拟盘（Demo Trading，demo-fapi.binance.com），使用模拟盘 API Key。
 //! - `live`：币安实盘，必须额外设置确认变量，单笔金额上限默认更低。
 
-use std::collections::HashMap;
-use std::path::Path;
+mod guard;
+mod overview;
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,14 +28,20 @@ use tokio::sync::{watch, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::binance::{number, outbound_proxy, Binance};
+use crate::notifications::{Message, Notifier};
 use crate::now_ms;
 use crate::store::Store;
+use guard::Pause;
 
 pub const LIVE_CONFIRMATION: &str = "YES_I_UNDERSTAND_REAL_MONEY";
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const BALANCE_CACHE_MS: i64 = 15_000;
 const EXECUTION_RETRY_MS: i64 = 60_000;
 pub(crate) const HISTORY_LIMIT: i64 = 100;
+/// 每隔这么久和币安对一次账。
+const RECONCILE_INTERVAL_MS: i64 = 60_000;
+/// 总览页的账户资金和持仓缓存这么久，避免每次刷新都请求币安。
+const OVERVIEW_CACHE_MS: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -117,6 +126,12 @@ pub struct Settings {
     pub max_notional: f64,
     pub max_open_trades: usize,
     pub max_leverage: u32,
+    /// 北京时间当天已实现亏损达到这个金额（USDT）就暂停开新仓。
+    pub daily_loss_limit: f64,
+    /// 开仓前把合约切换为逐仓，每笔交易的亏损只限于自己的保证金。
+    pub isolated_margin: bool,
+    /// 同一个币平仓后多少分钟内不再开仓，0 表示不冷却。
+    pub symbol_cooldown_minutes: f64,
     /// Why trading is unavailable even though a mode was requested.
     pub problem: Option<String>,
     api_key: String,
@@ -163,10 +178,10 @@ impl Settings {
         let requested = get("PLAYGROUND_TRADING_MODE")
             .map(|mode| mode.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "off".into());
-        let (mode, key_name, secret_name, default_notional) = match requested.as_str() {
-            "demo" => (Mode::Demo, "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_API_SECRET", 200.0),
-            "live" => (Mode::Live, "BINANCE_API_KEY", "BINANCE_API_SECRET", 20.0),
-            _ => (Mode::Off, "", "", 0.0),
+        let (mode, key_name, secret_name, default_notional, default_daily_loss) = match requested.as_str() {
+            "demo" => (Mode::Demo, "BINANCE_DEMO_API_KEY", "BINANCE_DEMO_API_SECRET", 200.0, 100.0),
+            "live" => (Mode::Live, "BINANCE_API_KEY", "BINANCE_API_SECRET", 20.0, 10.0),
+            _ => (Mode::Off, "", "", 0.0, 0.0),
         };
         let positive = |name: &str, fallback: f64| {
             get(name)
@@ -179,6 +194,12 @@ impl Settings {
             max_notional: positive("PLAYGROUND_MAX_ORDER_NOTIONAL", default_notional),
             max_open_trades: positive("PLAYGROUND_MAX_OPEN_TRADES", 3.0) as usize,
             max_leverage: (positive("PLAYGROUND_MAX_LEVERAGE", 5.0) as u32).clamp(1, 20),
+            daily_loss_limit: positive("PLAYGROUND_DAILY_LOSS_LIMIT", default_daily_loss),
+            isolated_margin: get("PLAYGROUND_MARGIN_MODE").is_none_or(|mode| !mode.trim().eq_ignore_ascii_case("cross")),
+            symbol_cooldown_minutes: get("PLAYGROUND_SYMBOL_COOLDOWN_MINUTES")
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(30.0),
             problem: None,
             api_key: String::new(),
             secret: String::new(),
@@ -368,6 +389,17 @@ pub struct Trader {
     account: RwLock<Account>,
     store: Arc<Store>,
     market_data: Arc<Binance>,
+    notifier: Arc<Notifier>,
+    guard_path: PathBuf,
+    /// 手动暂停开仓（一键全平之后），恢复前所有策略都不能开新仓。
+    pause: Mutex<Option<Pause>>,
+    /// 最近一次对账的结果。
+    reconciliation: Mutex<Value>,
+    /// 已经发过钉钉提醒、还没解决的对账问题，避免每分钟重复提醒。
+    notified: Mutex<HashSet<String>>,
+    last_reconcile: Mutex<i64>,
+    /// 总览页最近一次读取的账户资金和持仓。
+    overview_cache: Mutex<Option<(i64, Value, Value)>>,
     /// Serializes submit / close / periodic checks so one trade is never handled twice.
     operations: Mutex<()>,
     balance: Mutex<Option<(i64, Value)>>,
@@ -375,11 +407,19 @@ pub struct Trader {
 }
 
 impl Trader {
-    pub fn new(settings: Settings, store: Arc<Store>, market_data: Arc<Binance>) -> Self {
+    pub fn new(settings: Settings, store: Arc<Store>, market_data: Arc<Binance>, notifier: Arc<Notifier>) -> Self {
+        let guard_path = store.trading_guard_path();
         Self {
             account: RwLock::new(Account::new(settings)),
+            pause: Mutex::new(guard::load_pause(&guard_path)),
+            guard_path,
             store,
             market_data,
+            notifier,
+            reconciliation: Mutex::new(Value::Null),
+            notified: Mutex::new(HashSet::new()),
+            last_reconcile: Mutex::new(0),
+            overview_cache: Mutex::new(None),
             operations: Mutex::new(()),
             balance: Mutex::new(None),
             execution_attempts: Mutex::new(HashMap::new()),
@@ -447,7 +487,11 @@ impl Trader {
                 "maxNotional": settings.max_notional,
                 "maxOpenTrades": settings.max_open_trades,
                 "maxLeverage": settings.max_leverage,
+                "dailyLossLimit": settings.daily_loss_limit,
+                "isolatedMargin": settings.isolated_margin,
+                "symbolCooldownMinutes": settings.symbol_cooldown_minutes,
             },
+            "guard": self.guard_status(&account).await,
             "balance": self.balance(account.exchange.as_ref()).await,
             "trades": trades,
         })
@@ -513,6 +557,20 @@ impl Trader {
                 .unwrap_or_else(|| "交易未开启，请在「账号设置」中连接币安。".into()));
         };
         Self::check_intent(settings, &intent)?;
+        if let Some(reason) = self.entry_block(&account).await {
+            return Err(reason);
+        }
+        let cooldown = (settings.symbol_cooldown_minutes * 60_000.0) as i64;
+        if cooldown > 0 {
+            let recent = self.account_trades_since(&account, now_ms() - cooldown);
+            if let Some(rest) = guard::cooldown_remaining(&recent, &intent.symbol, now_ms(), cooldown) {
+                return Err(format!(
+                    "{} 上一笔交易刚平仓，冷却中，还要等约 {} 分钟（PLAYGROUND_SYMBOL_COOLDOWN_MINUTES）。",
+                    intent.symbol,
+                    (rest + 59_999) / 60_000
+                ));
+            }
+        }
         let active = self.store.active_trades().map_err(|_| "无法读取进行中的交易。")?;
         let account_trades = active.iter().filter(|trade| trade["mode"] == json!(settings.mode)
             && account.matches_key(trade["accountFingerprint"].as_str()));
@@ -558,6 +616,9 @@ impl Trader {
         let mark = mark_price(&mut core, &intent.symbol).await?;
         let amount = order_amount(&core, &unified, &market, intent.notional, mark)?;
 
+        if settings.isolated_margin {
+            set_isolated_margin(&mut core, &intent.symbol).await?;
+        }
         set_entry_leverage(&mut core, &intent, shared_leverage).await?;
 
         let now = now_ms();
@@ -610,6 +671,9 @@ impl Trader {
                 trade.closed_at = Some(now_ms());
                 trade.orders.push(failed_order("entry", intent.side.entry(), amount, None, &error));
                 self.save(&trade)?;
+                let mut lines = guard::trade_lines(&trade);
+                lines.push(format!("错误：{error}"));
+                self.notify("【开仓失败】", lines, format!("entry-failed:{}", trade.id));
                 return Err(trade.error.clone().unwrap_or_default());
             }
         };
@@ -668,6 +732,7 @@ impl Trader {
         }
         drop(core);
         self.invalidate_balance().await;
+        self.notify("【开仓】", guard::trade_lines(&trade), format!("open:{}", trade.id));
         Ok(trade.public_value())
     }
 
@@ -777,6 +842,7 @@ impl Trader {
         trade.exit_reason = Some("仓位已在交易所平掉（来源待核实）".into());
         trade.closed_at = Some(now_ms());
         let _ = self.save(trade);
+        self.notify("【平仓】止损或止盈已触发", guard::close_lines(trade), format!("close:{}", trade.id));
     }
 
     /// Cancels the protective orders and closes whatever position remains.
@@ -805,6 +871,9 @@ impl Trader {
                     trade.orders.push(failed_order("exit", side, amount, None, &error));
                     trade.error = Some(format!("平仓失败，请到币安手动处理：{error}"));
                     let _ = self.save(trade);
+                    let mut lines = guard::trade_lines(trade);
+                    lines.push(format!("错误：{error}"));
+                    self.notify("【平仓失败】请到币安手动处理", lines, format!("close-failed:{}", trade.id));
                     return;
                 }
             }
@@ -813,6 +882,225 @@ impl Trader {
         trade.exit_reason = Some(reason.into());
         trade.closed_at = Some(now_ms());
         let _ = self.save(trade);
+        self.notify("【平仓】", guard::close_lines(trade), format!("close:{}", trade.id));
+    }
+
+    /// 工作台总览：账户资金、全部持仓（含浮动盈亏）和当前账户的已实现盈亏曲线。
+    pub async fn overview(&self) -> Value {
+        let account = self.account.read().await;
+        let today = guard::beijing_day_start(now_ms());
+        let trades: Vec<Trade> = self
+            .store
+            .trades_opened_since(0)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<Trade>(row).ok())
+            .filter(|trade| trade.mode == account.settings.mode && account.matches_key(trade.account_fingerprint.as_deref()))
+            .collect();
+        let pnl = overview::pnl_summary(&trades, today);
+        let (funds, positions) = match &account.exchange {
+            Some(exchange) => self.overview_funds(exchange, &trades).await,
+            None => (Value::Null, json!([])),
+        };
+        json!({
+            "mode": account.settings.mode,
+            "enabled": account.settings.enabled(),
+            "account": funds,
+            "positions": positions,
+            "pnl": pnl,
+        })
+    }
+
+    async fn overview_funds(&self, exchange: &Mutex<BinanceusdmCore>, trades: &[Trade]) -> (Value, Value) {
+        let mut cache = self.overview_cache.lock().await;
+        if let Some((time, funds, positions)) = cache.as_ref() {
+            if now_ms() - time < OVERVIEW_CACHE_MS {
+                return (funds.clone(), positions.clone());
+            }
+        }
+        // 正在下单时不排队等待，先显示上一次的数据。
+        let Ok(mut core) = exchange.try_lock() else {
+            return cache.as_ref().map_or((Value::Null, json!([])), |(_, funds, positions)| (funds.clone(), positions.clone()));
+        };
+        let all = || [ExchangeValue::from_json(&json!({}))];
+        let account = typed(core.fapi_private_v3_get_account(&all())).await.map(|value| value.to_json());
+        let rows = typed(core.fapi_private_v3_get_position_risk(&all())).await.map(|value| value.to_json());
+        drop(core);
+        let now = now_ms();
+        let funds = match account {
+            Ok(account) => overview::account_summary(&account, now),
+            Err(error) => json!({"error": error}),
+        };
+        let active: Vec<Trade> = trades.iter().filter(|trade| matches!(trade.status.as_str(), "opening" | "open" | "closing")).cloned().collect();
+        let positions = match rows {
+            Ok(Value::Array(rows)) => json!(overview::positions(&rows, &active)),
+            _ => json!([]),
+        };
+        *cache = Some((now, funds.clone(), positions.clone()));
+        (funds, positions)
+    }
+
+    /// 后台发送钉钉通知，不让网络请求拖慢下单和平仓。没配置钉钉时什么也不做。
+    fn notify(&self, title: &str, lines: Vec<String>, id: String) {
+        let notifier = Arc::clone(&self.notifier);
+        let message = Message::alert(title, lines, id);
+        tokio::spawn(async move {
+            notifier.send(message).await;
+        });
+    }
+
+    /// 当前账户最近两天开仓的交易（每日亏损只看当天平仓的，持仓最长 24 小时）。
+    fn account_trades_since(&self, account: &Account, since: i64) -> Vec<Trade> {
+        self.store
+            .trades_opened_since(since - 2 * 86_400_000)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<Trade>(row).ok())
+            .filter(|trade| trade.mode == account.settings.mode && account.matches_key(trade.account_fingerprint.as_deref()))
+            .collect()
+    }
+
+    fn daily_loss(&self, account: &Account) -> f64 {
+        let today = guard::beijing_day_start(now_ms());
+        guard::loss_since(&self.account_trades_since(account, today), today)
+    }
+
+    /// 不能开新仓的原因：手动暂停、当天亏损达到上限、对账发现止损单缺失。
+    async fn entry_block(&self, account: &Account) -> Option<String> {
+        if let Some(pause) = self.pause.lock().await.as_ref() {
+            return Some(format!("已暂停开新仓（{}），请在「交易保护」点「恢复开仓」后再下单。", pause.reason));
+        }
+        let limit = account.settings.daily_loss_limit;
+        let loss = self.daily_loss(account);
+        if limit > 0.0 && loss >= limit {
+            return Some(format!(
+                "今天（北京时间）已实现亏损 {loss:.2} USDT，达到每日上限 {limit} USDT，暂停开新仓，明天 0 点自动恢复。"
+            ));
+        }
+        let report = self.reconciliation.lock().await;
+        let critical = report["issues"].as_array().and_then(|issues| issues.iter().find(|issue| issue["level"] == "critical"));
+        critical.map(|issue| format!("对账发现严重问题，暂停开新仓：{}", issue["message"].as_str().unwrap_or("请核对交易所持仓。")))
+    }
+
+    async fn guard_status(&self, account: &Account) -> Value {
+        json!({
+            "pause": self.pause.lock().await.clone(),
+            "dailyLoss": (self.daily_loss(account) * 100.0).round() / 100.0,
+            "blocked": self.entry_block(account).await,
+            "reconciliation": self.reconciliation.lock().await.clone(),
+        })
+    }
+
+    /// 一键全平：先暂停开新仓，再逐笔撤掉保护单、市价平掉当前账户所有策略交易。
+    pub async fn close_all(&self, account_revision: Uuid) -> TradeResult<Value> {
+        let _operation = self.operations.lock().await;
+        let account = self.account.read().await;
+        if account_revision != account.revision {
+            return Err("币安账号设置已更新，请刷新后重试。".into());
+        }
+        let pause = Pause { at: now_ms(), reason: "一键全平".into() };
+        guard::save_pause(&self.guard_path, Some(&pause)).map_err(|_| "无法保存暂停状态。")?;
+        *self.pause.lock().await = Some(pause);
+        let Some(exchange) = &account.exchange else {
+            return Ok(json!({"closed": 0, "failed": [], "paused": true}));
+        };
+        let active = self.store.active_trades().map_err(|_| "无法读取进行中的交易。")?;
+        let mut closed = 0;
+        let mut failed = Vec::new();
+        for row in active {
+            let Ok(mut trade) = serde_json::from_value::<Trade>(row) else { continue };
+            if trade.mode != account.settings.mode || !account.matches_key(trade.account_fingerprint.as_deref()) {
+                continue;
+            }
+            let mut core = exchange.lock().await;
+            self.close_locked(&mut core, &mut trade, "一键全平").await;
+            drop(core);
+            if trade.status == "closed" {
+                closed += 1;
+            } else {
+                failed.push(json!({"symbol": trade.symbol, "error": trade.error.clone().unwrap_or_else(|| "平仓尚未完成。".into())}));
+            }
+        }
+        self.invalidate_balance().await;
+        let mut lines = vec![format!("已平仓 {closed} 笔，暂停开新仓。")];
+        lines.extend(failed.iter().map(|item| format!("{} 平仓失败：{}", item["symbol"].as_str().unwrap_or("?"), item["error"].as_str().unwrap_or(""))));
+        self.notify("【交易保护】一键全平", lines, format!("close-all:{}", now_ms()));
+        // 平仓后马上重新对账，旧的问题不用等一分钟才消失。
+        *self.last_reconcile.lock().await = 0;
+        Ok(json!({"closed": closed, "failed": failed, "paused": true}))
+    }
+
+    /// 解除手动暂停。当天亏损上限和对账问题不受影响。
+    pub async fn resume(&self, account_revision: Uuid) -> TradeResult<Value> {
+        let _operation = self.operations.lock().await;
+        let account = self.account.read().await;
+        if account_revision != account.revision {
+            return Err("币安账号设置已更新，请刷新后重试。".into());
+        }
+        guard::save_pause(&self.guard_path, None).map_err(|_| "无法保存暂停状态。")?;
+        *self.pause.lock().await = None;
+        *self.last_reconcile.lock().await = 0;
+        Ok(json!({"paused": false, "blocked": self.entry_block(&account).await}))
+    }
+
+    async fn reconcile_if_due(&self) {
+        {
+            let mut last = self.last_reconcile.lock().await;
+            if now_ms() - *last < RECONCILE_INTERVAL_MS {
+                return;
+            }
+            *last = now_ms();
+        }
+        self.reconcile().await;
+    }
+
+    /// 对账：比对本地进行中的交易和币安的持仓、挂单、条件单；新出现的问题发钉钉提醒。
+    async fn reconcile(&self) {
+        let _operation = self.operations.lock().await;
+        let account = self.account.read().await;
+        let Some(exchange) = &account.exchange else {
+            *self.reconciliation.lock().await = Value::Null;
+            return;
+        };
+        let trades: Vec<Trade> = self
+            .store
+            .active_trades()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| serde_json::from_value::<Trade>(row).ok())
+            .filter(|trade| trade.mode == account.settings.mode && account.matches_key(trade.account_fingerprint.as_deref()))
+            .collect();
+        let mut core = exchange.lock().await;
+        let all = || [ExchangeValue::from_json(&json!({}))];
+        let fetched = async {
+            let positions = typed(core.fapi_private_v3_get_position_risk(&all())).await?.to_json();
+            let orders = typed(core.fapi_private_get_open_orders(&all())).await?.to_json();
+            let algos = typed(core.fapi_private_get_open_algo_orders(&all())).await?.to_json();
+            Ok::<_, String>((positions, orders, algos))
+        }
+        .await;
+        drop(core);
+        let now = now_ms();
+        let (issues, report) = match fetched {
+            Ok((Value::Array(positions), Value::Array(orders), Value::Array(algos))) => {
+                let issues = guard::reconcile(&trades, &positions, &orders, &algos, now);
+                let report = guard::report(now, &issues, None);
+                (issues, report)
+            }
+            Ok(_) => (Vec::new(), guard::report(now, &[], Some("无法解析币安返回的持仓或挂单。"))),
+            Err(error) => (Vec::new(), guard::report(now, &[], Some(&format!("对账失败：{error}")))),
+        };
+        *self.reconciliation.lock().await = report;
+        let mut notified = self.notified.lock().await;
+        let current: HashSet<String> = issues.iter().map(guard::Issue::key).collect();
+        let fresh: Vec<&guard::Issue> = issues.iter().filter(|issue| !notified.contains(&issue.key())).collect();
+        if !fresh.is_empty() {
+            let lines = fresh.iter().map(|issue| issue.message.clone()).collect();
+            let id = format!("reconcile:{}", fresh.iter().map(|issue| issue.key()).collect::<Vec<_>>().join(","));
+            self.notify("【交易保护】对账发现问题", lines, id);
+        }
+        // 已解决的问题从记录里去掉，再次出现时会重新提醒。
+        *notified = current;
     }
 
     fn load(&self, id: &str) -> TradeResult<Trade> {
@@ -892,6 +1180,7 @@ pub async fn supervise(trader: Arc<Trader>, mut stop: watch::Receiver<bool>) {
     while !*stop.borrow() {
         trader.check().await;
         trader.refresh_executions().await;
+        trader.reconcile_if_due().await;
         tokio::select! {
             _ = tokio::time::sleep(CHECK_INTERVAL) => {},
             _ = stop.changed() => {},
@@ -1039,6 +1328,18 @@ async fn check_open_orders(core: &mut BinanceusdmCore, symbol: &str, side: Side)
         return Err(format!("{symbol} 有同方向未成交订单，请核对后再下单。"));
     }
     Ok(pending.into_iter().any(|order| order["positionSide"] == side.opposite().position_side()))
+}
+
+/// 把合约切换为逐仓。已经是逐仓时币安返回 -4046，视为成功；有全仓持仓或挂单时无法切换，拒绝开仓。
+async fn set_isolated_margin(core: &mut BinanceusdmCore, symbol: &str) -> TradeResult<()> {
+    let request = [ExchangeValue::from_json(&json!({"symbol": symbol, "marginType": "ISOLATED"}))];
+    match typed(core.fapi_private_post_margin_type(&request)).await {
+        Ok(_) => Ok(()),
+        Err(error) if guard::already_isolated(&error) => Ok(()),
+        Err(error) => Err(format!(
+            "{symbol} 无法切换为逐仓（{error}）。如果这个币已有全仓持仓或挂单，请先处理；也可以设置 PLAYGROUND_MARGIN_MODE=cross 关闭逐仓。"
+        )),
+    }
 }
 
 async fn set_entry_leverage(core: &mut BinanceusdmCore, intent: &OrderIntent, shared: bool) -> TradeResult<()> {
@@ -1280,9 +1581,33 @@ mod tests {
         assert!(Trader::check_intent(&trader_settings, &intent).unwrap_err().contains("上限"));
     }
 
+    fn notifier() -> Arc<Notifier> {
+        Arc::new(Notifier::new(false).unwrap())
+    }
+
+    #[tokio::test]
+    async fn close_all_pauses_new_entries_until_resumed() {
+        let directory = std::env::temp_dir().join(format!("guard-trader-{}", Uuid::new_v4()));
+        let store = Arc::new(Store::open(&directory.join("monitor.sqlite")).unwrap());
+        let trader = Trader::new(settings(&[]), Arc::clone(&store), Arc::new(Binance::new()), notifier());
+        let revision = trader.account.read().await.revision;
+        assert!(trader.close_all(Uuid::new_v4()).await.unwrap_err().contains("账号设置已更新"));
+        let result = trader.close_all(revision).await.unwrap();
+        assert_eq!(result["paused"], true);
+        let blocked = trader.entry_block(&*trader.account.read().await).await.unwrap();
+        assert!(blocked.contains("一键全平"));
+        // 暂停状态写在文件里，服务重启后仍然有效。
+        let restarted = Trader::new(settings(&[]), Arc::clone(&store), Arc::new(Binance::new()), notifier());
+        assert!(restarted.entry_block(&*restarted.account.read().await).await.is_some());
+        assert_eq!(trader.status().await["guard"]["pause"]["reason"], "一键全平");
+        trader.resume(revision).await.unwrap();
+        assert!(trader.entry_block(&*trader.account.read().await).await.is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     #[tokio::test]
     async fn a_changed_account_rejects_an_order_before_contacting_binance() {
-        let trader = Trader::new(settings(&[]), Arc::new(Store::open_memory().unwrap()), Arc::new(Binance::new()));
+        let trader = Trader::new(settings(&[]), Arc::new(Store::open_memory().unwrap()), Arc::new(Binance::new()), notifier());
         let intent = OrderIntent {
             strategy_id: "test".into(), strategy_name: "测试策略".into(), symbol: "BTCUSDT".into(),
             side: Side::Long, notional: 20.0, leverage: 2, stop_loss_percent: 1.0,
@@ -1374,7 +1699,7 @@ mod tests {
             ("BINANCE_DEMO_API_KEY", "fixture-key"),
             ("BINANCE_DEMO_API_SECRET", "fixture-secret"),
         ]);
-        let trader = Trader::new(settings, Arc::new(Store::open_memory().unwrap()), Arc::new(Binance::new()));
+        let trader = Trader::new(settings, Arc::new(Store::open_memory().unwrap()), Arc::new(Binance::new()), notifier());
         for mode in ["demo", "live"] {
             let login = serde_json::from_value(json!({
                 "action": "login", "mode": mode, "apiKey": "new-key", "secret": "new-secret", "confirmLive": true,
@@ -1395,7 +1720,7 @@ mod tests {
         crate::store::write_private_json(&path, &json!({
             "mode": "demo", "apiKey": "fixture-key", "secret": "fixture-secret",
         })).unwrap();
-        let trader = Trader::new(Settings::load(&path), store, Arc::new(Binance::new()));
+        let trader = Trader::new(Settings::load(&path), store, Arc::new(Binance::new()), notifier());
         let revision = trader.account.read().await.revision.to_string();
         trader.change_account(AccountChange::Logout {
             account_revision: revision,

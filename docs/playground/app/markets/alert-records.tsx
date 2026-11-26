@@ -15,12 +15,14 @@ function dayKey({ symbol, time }: AlertHistoryRow) {
   return JSON.stringify([alertDayStart(time), symbol]);
 }
 
-export default function AlertRecords({ records, canDelete, onDelete }: {
+export default function AlertRecords({ records, canDelete, onDelete, defaultOpen = false }: {
   records: readonly AlertHistoryRow[];
   canDelete: boolean;
   onDelete: (records: readonly SpikeIdentity[]) => Promise<void>;
+  /** 工作台的「异动记录」页默认展开。 */
+  defaultOpen?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultOpen);
   const { selected, count, deleting, error, deletedCount, allSelected, partlySelected, select, selectAll, deleteSelected } =
     useRecordSelection(records, spikeKey, {
       label: "告警记录", canDelete, onDelete: (rows) => onDelete(rows.map(({ symbol, time, threshold }) => ({ symbol, time, threshold }))),
@@ -65,7 +67,7 @@ export default function AlertRecords({ records, canDelete, onDelete }: {
   }, [expanded, keys]);
 
   return (
-    <details className={styles.turnover} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <details className={styles.turnover} open={defaultOpen || undefined} onToggle={(event) => setExpanded(event.currentTarget.open)}>
       <summary className={styles.monitorSectionSummary}>
         <h4>告警记录 <span>最近 {SPIKE_RECORD_LIMIT} 条</span></h4>
       </summary>

@@ -1,6 +1,6 @@
 //! 本地历史行情缓存与市场数据存档（单独的 SQLite 文件，不和监控数据库混在一起）。
 //!
-//! - 缓存：历史扫描下载过的 1 分钟K线、5 分钟持仓量和资金费率。已经收盘的历史数据不会再变，
+//! - 缓存：历史扫描下载过的 1 分钟K线、5 分钟持仓量和资金费率，以及研究数据集的小时K线。已经收盘的历史数据不会再变，
 //!   之后调整参数重新扫描时直接读本地，只下载缺的部分。每类数据按合约记录一段「已下载区间」。
 //! - 存档：后台定期保存的标记价 / 指数价 / 资金费率快照、多空比，以及实时收到的强平单。
 //!   币安的持仓量和多空比只保留约 30 天、强平推送没有历史，所以要自己存。
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::store::Result;
 
 const MINUTE: i64 = 60_000;
+const HOUR: i64 = 60 * MINUTE;
 
 /// One finished candle. `end` is exclusive: the bar covers `[time, end)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,6 +32,7 @@ pub(crate) struct Bar {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Klines,
+    HourKlines,
     OpenInterest,
     Funding,
 }
@@ -39,10 +41,31 @@ impl Kind {
     fn key(self) -> &'static str {
         match self {
             Kind::Klines => "kline_1m",
+            Kind::HourKlines => "kline_1h",
             Kind::OpenInterest => "open_interest_5m",
             Kind::Funding => "funding",
         }
     }
+
+    /// K线种类对应的表名和每根K线的时长。
+    fn candles(self) -> Result<(&'static str, i64)> {
+        match self {
+            Kind::Klines => Ok(("kline_1m", MINUTE)),
+            Kind::HourKlines => Ok(("kline_1h", HOUR)),
+            Kind::OpenInterest | Kind::Funding => Err("not a candle kind".into()),
+        }
+    }
+}
+
+/// 研究数据集里的一个 USDⓈ-M 永续合约，包括已下架的。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Contract {
+    pub symbol: String,
+    /// 上线时间；只在币安公开数据仓库里的合约没有这项。
+    pub onboard: Option<i64>,
+    /// 下架时间；仍在交易，或只在公开数据仓库里、尚未确定时为 `None`。
+    pub delisted: Option<i64>,
+    pub status: String,
 }
 
 /// A forced liquidation pushed by Binance. `side` is the order side: BUY closes a short.
@@ -70,6 +93,13 @@ impl History {
             "CREATE TABLE IF NOT EXISTS kline_1m (
                 symbol TEXT NOT NULL, time INTEGER NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
                 close REAL NOT NULL, quote REAL NOT NULL, taker REAL NOT NULL, PRIMARY KEY (symbol, time)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS kline_1h (
+                symbol TEXT NOT NULL, time INTEGER NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+                close REAL NOT NULL, quote REAL NOT NULL, taker REAL NOT NULL, PRIMARY KEY (symbol, time)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS contract_list (
+                symbol TEXT PRIMARY KEY, onboard INTEGER, delisted INTEGER, status TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS open_interest_5m (
                 symbol TEXT NOT NULL, time INTEGER NOT NULL, value REAL NOT NULL, PRIMARY KEY (symbol, time)
@@ -130,10 +160,15 @@ impl History {
     }
 
     pub fn save_bars(&self, symbol: &str, bars: &[Bar]) -> Result<()> {
+        self.save_candles(Kind::Klines, symbol, bars)
+    }
+
+    pub fn save_candles(&self, kind: Kind, symbol: &str, bars: &[Bar]) -> Result<()> {
+        let (table, _) = kind.candles()?;
         let mut db = self.db()?;
         let tx = db.transaction()?;
         {
-            let mut insert = tx.prepare_cached("INSERT OR REPLACE INTO kline_1m VALUES (?, ?, ?, ?, ?, ?, ?, ?)")?;
+            let mut insert = tx.prepare_cached(&format!("INSERT OR REPLACE INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))?;
             for bar in bars {
                 insert.execute(params![symbol, bar.time, bar.open, bar.high, bar.low, bar.close, bar.quote, bar.taker_quote])?;
             }
@@ -144,15 +179,21 @@ impl History {
 
     /// One-minute bars starting in `[start, end)`, oldest first.
     pub fn bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>> {
+        self.candles(Kind::Klines, symbol, start, end)
+    }
+
+    /// 某种K线中开始时间在 `[start, end)` 的部分，按时间从早到晚。
+    pub fn candles(&self, kind: Kind, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>> {
+        let (table, length) = kind.candles()?;
         let db = self.db()?;
-        let mut query = db.prepare_cached(
-            "SELECT time, open, high, low, close, quote, taker FROM kline_1m WHERE symbol = ? AND time >= ? AND time < ? ORDER BY time",
-        )?;
+        let mut query = db.prepare_cached(&format!(
+            "SELECT time, open, high, low, close, quote, taker FROM {table} WHERE symbol = ? AND time >= ? AND time < ? ORDER BY time",
+        ))?;
         let rows = query.query_map(params![symbol, start, end], |row| {
             let time: i64 = row.get(0)?;
             Ok(Bar {
                 time,
-                end: time + MINUTE,
+                end: time + length,
                 open: row.get(1)?,
                 high: row.get(2)?,
                 low: row.get(3)?,
@@ -168,7 +209,7 @@ impl History {
         let sql = match kind {
             Kind::OpenInterest => "INSERT OR REPLACE INTO open_interest_5m VALUES (?, ?, ?)",
             Kind::Funding => "INSERT OR REPLACE INTO funding VALUES (?, ?, ?)",
-            Kind::Klines => return Err("bars are saved with save_bars".into()),
+            Kind::Klines | Kind::HourKlines => return Err("bars are saved with save_candles".into()),
         };
         let mut db = self.db()?;
         let tx = db.transaction()?;
@@ -187,11 +228,35 @@ impl History {
         let sql = match kind {
             Kind::OpenInterest => "SELECT time, value FROM open_interest_5m WHERE symbol = ? AND time >= ? AND time <= ? ORDER BY time",
             Kind::Funding => "SELECT time, rate FROM funding WHERE symbol = ? AND time >= ? AND time <= ? ORDER BY time",
-            Kind::Klines => return Err("bars are read with bars".into()),
+            Kind::Klines | Kind::HourKlines => return Err("bars are read with candles".into()),
         };
         let db = self.db()?;
         let mut query = db.prepare_cached(sql)?;
         let rows = query.query_map(params![symbol, start, end], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 用新的合约全集替换旧的。
+    pub fn save_contracts(&self, contracts: &[Contract]) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM contract_list", [])?;
+        {
+            let mut insert = tx.prepare_cached("INSERT INTO contract_list VALUES (?, ?, ?, ?)")?;
+            for contract in contracts {
+                insert.execute(params![contract.symbol, contract.onboard, contract.delisted, contract.status])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn contracts(&self) -> Result<Vec<Contract>> {
+        let db = self.db()?;
+        let mut query = db.prepare_cached("SELECT symbol, onboard, delisted, status FROM contract_list ORDER BY symbol")?;
+        let rows = query.query_map([], |row| {
+            Ok(Contract { symbol: row.get(0)?, onboard: row.get(1)?, delisted: row.get(2)?, status: row.get(3)? })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -281,12 +346,18 @@ impl History {
         let liquidations = count("SELECT COUNT(*), MAX(time) FROM liquidation")?;
         let long_short = count("SELECT COUNT(DISTINCT symbol), MAX(time) FROM long_short_5m")?;
         let klines = count("SELECT COUNT(*), MAX(time) FROM kline_1m")?;
+        let hours = count("SELECT COUNT(*), MAX(time) FROM kline_1h")?;
+        let funding = count("SELECT COUNT(*), MAX(time) FROM funding")?;
+        let contracts = count("SELECT COUNT(*), MAX(delisted) FROM contract_list")?;
+        let delisted = count("SELECT COUNT(*), MAX(delisted) FROM contract_list WHERE status != 'TRADING'")?;
         let session = count("SELECT COUNT(*), MAX(end) FROM stream_session")?;
         Ok(json!({
             "premiumSnapshots": premium.0, "premiumAt": premium.1,
             "liquidations": liquidations.0, "liquidationAt": liquidations.1,
             "longShortSymbols": long_short.0, "longShortAt": long_short.1,
             "cachedBars": klines.0,
+            "hourBars": hours.0, "fundingPoints": funding.0,
+            "contracts": contracts.0, "delistedContracts": delisted.0,
             "streamAt": session.1,
         }))
     }
@@ -334,6 +405,13 @@ mod tests {
         history.set_coverage("BTCUSDT", Kind::Klines, 0, 3 * MINUTE).unwrap();
         assert_eq!(history.coverage("BTCUSDT", Kind::Klines).unwrap(), Some((0, 3 * MINUTE)));
         assert_eq!(history.coverage("BTCUSDT", Kind::Funding).unwrap(), None);
+        let hour = Bar { time: 0, end: HOUR, ..bar(0) };
+        history.save_candles(Kind::HourKlines, "BTCUSDT", &[hour]).unwrap();
+        assert_eq!(history.candles(Kind::HourKlines, "BTCUSDT", 0, HOUR).unwrap(), vec![hour]);
+        assert_eq!(history.bars("BTCUSDT", 0, 2 * MINUTE).unwrap().len(), 2);
+        let listed = Contract { symbol: "OMGUSDT".into(), onboard: Some(1), delisted: Some(5), status: "SETTLING".into() };
+        history.save_contracts(&[listed.clone()]).unwrap();
+        assert_eq!(history.contracts().unwrap(), vec![listed]);
         history.save_points("BTCUSDT", Kind::OpenInterest, &[(0, 5.0), (300_000, 6.0)]).unwrap();
         assert_eq!(history.points("BTCUSDT", Kind::OpenInterest, 0, 300_000).unwrap().len(), 2);
 
