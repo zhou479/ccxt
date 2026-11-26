@@ -7,8 +7,7 @@ import { readMarketResponse } from "@/lib/market-response";
 import type { SpikeIdentity } from "@/lib/price-alerts";
 
 const endpoint = apiUrl("/api/markets/background-monitor");
-type UpdateRule = BackgroundRule & { accountRevision?: string };
-type UpdateBody = UpdateRule | readonly SpikeIdentity[];
+type UpdateBody = BackgroundRule | readonly SpikeIdentity[];
 
 export function useBackgroundMonitor() {
   const [mode, setMode] = useState<"loading" | "local" | "browser">("loading");
@@ -71,7 +70,7 @@ export function useBackgroundMonitor() {
     }
   }
 
-  async function save(rule: UpdateRule) {
+  async function save(rule: BackgroundRule) {
     if (updating.current) return;
     setSaveError("");
     const message = "无法保存异动监控策略设置。";

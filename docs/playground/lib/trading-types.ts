@@ -7,11 +7,10 @@ export const STANDARD_TAKER_FEE_RATE = 0.0005;
 export type TradeExecution = { filled: number; quote: number };
 
 export type TradeOrder = {
-  kind: "entry" | "stop-loss" | "take-profit" | "exit" | "limit-exit";
+  kind: "entry" | "stop-loss" | "take-profit" | "exit";
   side: "buy" | "sell";
   amount: number;
   triggerPrice: number | null;
-  limitPrice?: number | null;
   exchangeId: string | null;
   average: number | null;
   execution?: TradeExecution | null;
@@ -35,7 +34,6 @@ export type Trade = {
   takeProfit: number | null;
   stopLossPercent: number;
   takeProfitPercent: number;
-  pendingLimitExitPercent?: number;
   deadline: number;
   status: TradeStatus;
   openedAt: number;
@@ -77,13 +75,6 @@ export type TestOrderRequest = {
 };
 
 export type TradingLoginMode = Exclude<TradingMode, "off">;
-
-export type PositionAction =
-  | { action: "limit-close"; price: number }
-  | { action: "cancel-limit-close" }
-  | { action: "set-protection"; stopLossPrice?: number; takeProfitPrice?: number };
-
-export type PositionRequest = PositionAction & { tradeId: string; accountRevision: string };
 
 export type TradingAccountRequest = {
   action: "login";
