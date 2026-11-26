@@ -104,3 +104,21 @@ test("features are bucketed in the direction of the move", () => {
   assert.deepEqual(groupStats(samples, "excess", 0, 0).map(({ bucket }) => bucket), ["2–3%", "3–5%"]);
   assert.deepEqual(groupStats(samples, "missing", 0, 0), []);
 });
+
+test("plan labels name the exit style and any hold other than an hour", async () => {
+  const { barrierLabel } = await import("./signal-stats.ts");
+  assert.equal(barrierLabel({ stop: 1, take: 0.75, hold: 5 }), "1% / 0.75% · 5 分钟");
+  assert.equal(barrierLabel({ stop: 2, take: 4, hold: 60 }), "2% / 4%");
+  assert.equal(barrierLabel({ kind: "trailing", stop: 3, take: null, hold: 240 }), "移动止损 3% · 4 小时");
+  assert.equal(barrierLabel({ kind: "volatility", stop: 1.5, take: 3, hold: 60 }), "1.5σ / 3σ（按波动率）");
+});
+
+test("tiered costs charge thin contracts more", async () => {
+  const { costFor, outcomeStats: stats } = await import("./signal-stats.ts");
+  const at = (volume) => sample({ symbol: `V${volume}`, features: { ...sample().features, quoteVolume24h: volume } });
+  assert.deepEqual([at(6e8), at(2e8), at(5e7), at(1e6), at(null)].map((one) => costFor(one, "tiered")), [0.14, 0.2, 0.3, 0.5, 0.5]);
+  assert.equal(costFor(at(1e6), 0.2), 0.2);
+  const rows = prepareSamples([at(6e8), at(1e6)]);
+  // Both win 2%: 1.86% and 1.5% after their tier's cost.
+  assert.ok(Math.abs(stats(rows, 0, "chase", "tiered").average - 1.68) < 1e-9);
+});

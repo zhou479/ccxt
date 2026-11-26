@@ -4,7 +4,12 @@ export type SignalSource = "live" | "scan";
 
 export type SignalExit = { exit: "stop" | "take" | "time"; pnl: number; minutes: number };
 
-export type SignalBarrier = { stop: number; take: number; chase: SignalExit | null; fade: SignalExit | null };
+export type PlanKind = "fixed" | "volatility" | "breakeven" | "trailing";
+
+/** An exit plan. Volatility plans measure stop and take in σ of hourly moves; trailing plans have no take. */
+export type SignalPlan = { kind?: PlanKind; stop: number; take: number | null; hold?: number };
+
+export type SignalBarrier = SignalPlan & { chase: SignalExit | null; fade: SignalExit | null };
 
 export type SignalFeatures = {
   /** Price change in the hour before the move, %. */
@@ -21,6 +26,12 @@ export type SignalFeatures = {
   quoteVolume24h: number | null;
   /** Beijing hour, 0–23. */
   hour: number;
+  /** High-to-low range of the 24 hours before the move, %, from complete one-minute bars. */
+  range24h?: number | null;
+  /** σ of one-minute returns over the 24 hours before, %. */
+  sigma1m?: number | null;
+  /** The move in units of the coin's normal volatility over the window. */
+  zScore?: number | null;
   /** Liquidated USDT in the 5 minutes before, pushing with the move (shorts on a rise, longs on a fall). */
   liqSame5?: number | null;
   /** Liquidated USDT in the 5 minutes before, against the move. */
@@ -48,7 +59,7 @@ export type SignalSample = {
   approximate?: boolean;
 };
 
-export type ScanParams = { days: number; top: number; percent: number; windowMinutes: number };
+export type ScanParams = { days: number; top: number; percent: number; windowMinutes: number; zScore?: number };
 
 export type SignalScan = {
   status: "idle" | "running" | "done" | "failed" | "interrupted";
@@ -77,7 +88,7 @@ export type SignalSnapshot = {
   source: SignalSource;
   samples: SignalSample[];
   scan: SignalScan;
-  barriers: { stop: number; take: number }[];
+  barriers: SignalPlan[];
   horizons: number[];
   archive?: ArchiveStatus | null;
 };

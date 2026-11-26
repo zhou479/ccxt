@@ -1,4 +1,4 @@
-import type { SignalExit, SignalSample } from "./signal-types";
+import type { SignalExit, SignalPlan, SignalSample } from "./signal-types";
 
 /** Groups with fewer samples than this are flagged: the numbers are mostly noise. */
 export const MIN_SAMPLES = 30;
@@ -10,11 +10,33 @@ export const MIN_EDGE = 0.15;
 export const MIN_PROFIT_FACTOR = 1.2;
 /** Credible results must survive removing this many best trades. */
 export const TRIMMED_TRADES = 2;
+export function barrierLabel({ kind = "fixed", stop, take, hold }: SignalPlan) {
+  const time = !hold || hold === 60 ? "" : hold % 60 === 0 ? ` · ${hold / 60} 小时` : ` · ${hold} 分钟`;
+  switch (kind) {
+    case "volatility": return `${stop}σ / ${take}σ（按波动率）${time}`;
+    case "breakeven": return `${stop}% / ${take}% 保本${time}`;
+    case "trailing": return `移动止损 ${stop}%${time}`;
+    default: return `${stop}% / ${take}%${time}`;
+  }
+}
+
 /** Liquidity floor options: 24h turnover before the signal, USDT. */
 export const LIQUIDITY_OPTIONS = [0, 2e7, 1e8] as const;
-/** Round-trip cost per trade, %: taker fees on both sides plus slippage. */
-export const COST_OPTIONS = [0.1, 0.15, 0.2, 0.3] as const;
-export const DEFAULT_COST = 0.2;
+/** Round-trip cost per trade, %: taker fees on both sides plus slippage, or tiered by liquidity. */
+export const COST_OPTIONS = [0.1, 0.15, 0.2, 0.3, "tiered"] as const;
+export type CostModel = number | "tiered";
+export const DEFAULT_COST: CostModel = "tiered";
+/**
+ * Tiered cost by the 24h turnover before the signal: 0.1% taker fees plus slippage on both sides,
+ * wider for thinner contracts. Unknown turnover gets the thinnest tier.
+ */
+export const COST_TIERS: readonly [number, number][] = [[5e8, 0.14], [1e8, 0.2], [2e7, 0.3], [0, 0.5]];
+
+export function costFor(sample: SignalSample, model: CostModel): number {
+  if (model !== "tiered") return model;
+  const volume = sample.features.quoteVolume24h ?? 0;
+  return COST_TIERS.find(([floor]) => volume >= floor)?.[1] ?? 0.5;
+}
 /** Symbols that moved during this much time before a signal count as moving with it. */
 export const CONCURRENCY_WINDOW_MS = 5 * 60_000;
 /** Samples closer than this in time belong to the same market event. */
@@ -163,12 +185,12 @@ export type OutcomeStats = TradeStats & {
 type Side = "chase" | "fade";
 
 /** Trade statistics that also look at independent events and at both halves of the period. */
-export function outcomeStats(samples: readonly StudySample[], barrier: number, side: Side, cost: number): OutcomeStats {
+export function outcomeStats(samples: readonly StudySample[], barrier: number, side: Side, cost: CostModel): OutcomeStats {
   const trades = samples.flatMap((sample) => {
     const exit = sample.barriers[barrier]?.[side];
-    return exit ? [{ sample, exit, net: exit.pnl - cost }] : [];
+    return exit ? [{ sample, exit, net: exit.pnl - costFor(sample, cost) }] : [];
   });
-  const base = tradeStats(trades.map(({ exit }) => exit), cost);
+  const base = tradeStats(trades.map(({ exit, net }) => ({ ...exit, pnl: net })), 0);
   const byEvent = new Map<number, number[]>();
   for (const { sample, net } of trades) byEvent.set(sample.context.event, [...(byEvent.get(sample.context.event) ?? []), net]);
   const eventMeans = [...byEvent.values()].map((values) => mean(values) ?? 0);
@@ -191,13 +213,12 @@ export function outcomeStats(samples: readonly StudySample[], barrier: number, s
   };
 }
 
-export type BarrierRow = { stop: number; take: number; chase: OutcomeStats; fade: OutcomeStats };
+export type BarrierRow = SignalPlan & { chase: OutcomeStats; fade: OutcomeStats };
 
-/** Simulated results per stop-loss / take-profit pair, chasing the move and fading it. */
-export function barrierStats(samples: readonly StudySample[], barriers: readonly { stop: number; take: number }[],
-  cost: number): BarrierRow[] {
-  return barriers.map(({ stop, take }, index) => ({
-    stop, take,
+/** Simulated results per exit plan, chasing the move and fading it. */
+export function barrierStats(samples: readonly StudySample[], barriers: readonly SignalPlan[], cost: CostModel): BarrierRow[] {
+  return barriers.map((plan, index) => ({
+    ...plan,
     chase: outcomeStats(samples, index, "chase", cost),
     fade: outcomeStats(samples, index, "fade", cost),
   }));
@@ -247,6 +268,11 @@ export const SIGNAL_GROUPS: readonly SignalGroup[] = [
     bucket: (sample) => ({ single: "个币独立（≤3 个）", mixed: "中间（4–9 个）", market: "全市场（≥10 个）" })[marketKind(sample.context.concurrent)] },
   { id: "excess", label: "相对 BTC 的超额涨跌", order: ["<2%", "2–3%", "3–5%", "5–10%", "≥10%", "未知"],
     bucket: (sample) => ranges(aligned(sample, sample.context.excess), [[2, "2–3%"], [3, "3–5%"], [5, "5–10%"], [10, "≥10%"]], "<2%") ?? "未知" },
+  { id: "zScore", label: "波动率倍数（异动是平时波动的几倍）", order: ["<3σ", "3–5σ", "5–8σ", "8–12σ", "≥12σ", "未知"],
+    bucket: (sample) => ranges(sample.features.zScore === null || sample.features.zScore === undefined ? null : Math.abs(sample.features.zScore),
+      [[3, "3–5σ"], [5, "5–8σ"], [8, "8–12σ"], [12, "≥12σ"]], "<3σ") ?? "未知" },
+  { id: "range24h", label: "前 24 小时振幅", order: ["≤3%", "3–5%", "5–10%", "10–20%", ">20%", "未知"],
+    bucket: (sample) => ranges(sample.features.range24h ?? null, [[3, "3–5%"], [5, "5–10%"], [10, "10–20%"], [20, ">20%"]], "≤3%") ?? "未知" },
   { id: "direction", label: "异动方向", order: ["上涨异动（追多）", "下跌异动（追空）"],
     bucket: (sample) => sample.direction === "up" ? "上涨异动（追多）" : "下跌异动（追空）" },
   { id: "change", label: "窗口涨跌幅", order: ["<2%", "2–3%", "3–5%", "5–10%", "≥10%"],
@@ -285,7 +311,7 @@ export const SIGNAL_GROUPS: readonly SignalGroup[] = [
 
 export type GroupRow = { bucket: string; chase: OutcomeStats; fade: OutcomeStats };
 
-export function groupStats(samples: readonly StudySample[], groupId: string, barrier: number, cost: number): GroupRow[] {
+export function groupStats(samples: readonly StudySample[], groupId: string, barrier: number, cost: CostModel): GroupRow[] {
   const group = SIGNAL_GROUPS.find(({ id }) => id === groupId);
   if (!group) return [];
   const buckets = new Map<string, StudySample[]>();

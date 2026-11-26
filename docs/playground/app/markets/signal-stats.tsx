@@ -3,14 +3,14 @@
 import { useMemo, useState, type FormEvent } from "react";
 import {
   COST_OPTIONS, DEFAULT_COST, LIQUIDITY_OPTIONS, MIN_EDGE, MIN_EVENTS, MIN_PROFIT_FACTOR, MIN_SAMPLES, TRIMMED_TRADES, SIGNAL_GROUPS, barrierStats, excursionStats, filterSamples,
-  groupStats, horizonStats, marketKind, prepareSamples, type OutcomeStats, type SampleFilter,
+  barrierLabel, groupStats, horizonStats, marketKind, prepareSamples, type CostModel, type OutcomeStats, type SampleFilter,
 } from "@/lib/signal-stats";
 import type { ArchiveStatus, ScanParams, SignalScan, SignalSource } from "@/lib/signal-types";
 import { useSignals } from "./use-signals";
 import styles from "./markets.module.css";
 
 const formatTime = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", dateStyle: "short", timeStyle: "short" });
-const defaultScan = { days: "7", top: "100", percent: "3", windowMinutes: "5" };
+const defaultScan = { days: "30", top: "100", percent: "3", windowMinutes: "5", zScore: "0" };
 
 function pct(value: number | null | undefined, digits = 2) {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
@@ -57,7 +57,7 @@ export default function SignalStats() {
   const [filter, setFilter] = useState<SampleFilter>({
     direction: "all", minMultiple: 0, alertedOnly: true, market: "all", minVolume: 2e7,
   });
-  const [cost, setCost] = useState(DEFAULT_COST);
+  const [cost, setCost] = useState<CostModel>(DEFAULT_COST);
   const [groupId, setGroupId] = useState("direction");
   const [barrier, setBarrier] = useState(1);
   const [scanForm, setScanForm] = useState(defaultScan);
@@ -81,6 +81,7 @@ export default function SignalStats() {
     const params: ScanParams = {
       days: Math.trunc(Number(scanForm.days)), top: Math.trunc(Number(scanForm.top)),
       percent: Number(scanForm.percent), windowMinutes: Math.trunc(Number(scanForm.windowMinutes)),
+      zScore: Number(scanForm.zScore),
     };
     if (!window.confirm(`开始扫描？将读取成交额前 ${params.top} 的合约最近 ${params.days} 天的 1 分钟K线，` +
       `大约需要 ${Math.max(1, Math.round(params.top * (1.6 * params.days + 2) * 1.4 / 60))} 分钟，并替换上次的扫描结果。已下载过的K线和持仓量会直接读本地缓存，重复扫描会快很多。`)) return;
@@ -133,8 +134,9 @@ export default function SignalStats() {
             </select>
             <label htmlFor="signal-cost">每笔成本</label>
             <select id="signal-cost" className={styles.tradingSelect} value={cost}
-              onChange={(event) => setCost(Number(event.target.value))}>
-              {COST_OPTIONS.map((value) => <option key={value} value={value}>{value}%</option>)}
+              onChange={(event) => setCost(event.target.value === "tiered" ? "tiered" : Number(event.target.value))}>
+              {COST_OPTIONS.map((value) => <option key={value} value={value}>
+                {value === "tiered" ? "按流动性分档" : `${value}%`}</option>)}
             </select>
             <label htmlFor="signal-market">行情类型</label>
             <select id="signal-market" className={styles.tradingSelect} value={filter.market}
@@ -158,7 +160,7 @@ export default function SignalStats() {
 
           {source === "scan" ? <form className={styles.monitorForm} onSubmit={scan}>
             <label htmlFor="scan-days">最近</label>
-            <input id="scan-days" type="number" min={1} max={30} required value={scanForm.days} disabled={running}
+            <input id="scan-days" type="number" min={1} max={365} required value={scanForm.days} disabled={running}
               onChange={(event) => setScanForm({ ...scanForm, days: event.target.value })} />天，
             <label htmlFor="scan-top">成交额前</label>
             <input id="scan-top" type="number" min={10} max={300} required value={scanForm.top} disabled={running}
@@ -168,7 +170,10 @@ export default function SignalStats() {
               onChange={(event) => setScanForm({ ...scanForm, windowMinutes: event.target.value })} />分钟内涨跌超过
             <input id="scan-percent" aria-label="涨跌幅阈值（%）" type="number" min={1} max={50} step="0.1" required
               value={scanForm.percent} disabled={running}
-              onChange={(event) => setScanForm({ ...scanForm, percent: event.target.value })} />%
+              onChange={(event) => setScanForm({ ...scanForm, percent: event.target.value })} />%，
+            <label htmlFor="scan-z">且至少是平时波动的</label>
+            <input id="scan-z" type="number" min={0} max={30} step="0.5" required value={scanForm.zScore} disabled={running}
+              onChange={(event) => setScanForm({ ...scanForm, zScore: event.target.value })} />倍（0 = 不限）
             <button type="submit" disabled={running}>{running ? "扫描中…" : "开始扫描"}</button>
           </form> : <p>实时告警在发生 1 小时后自动补算结果，需要开启「异动监控策略」并保持服务运行。</p>}
           {source === "scan" && data && <p role="status">{scanStatus(data.scan)}</p>}
@@ -180,11 +185,12 @@ export default function SignalStats() {
             {split && `前后两段以 ${formatTime.format(split)} 为界。`}
           </p>}
 
-          <h4>止损止盈模拟 <span>扣除每笔 {cost}% 成本</span></h4>
+          <h4>出场方式模拟 <span>
+            {cost === "tiered" ? "按流动性分档扣成本" : `扣除每笔 ${cost}% 成本`}；未注明时长的最多持仓 60 分钟</span></h4>
           <div className={styles.tableScroll}>
             <table className={styles.alertTable}>
               <thead><tr>
-                <th scope="col">止损 / 止盈</th><th scope="col">样本 / 事件</th><th scope="col">追进去胜率</th>
+                <th scope="col">出场方式</th><th scope="col">样本 / 事件</th><th scope="col">追进去胜率</th>
                 <th scope="col">追进去每笔平均</th><th scope="col">前半段 / 后半段</th><th scope="col">盈利事件占比</th>
                 <th scope="col">总盈利 ÷ 总亏损</th><th scope="col">去掉最赚 {TRIMMED_TRADES} 笔</th>
                 <th scope="col">止盈 / 止损 / 到期</th><th scope="col">反向操作每笔平均</th>
@@ -192,8 +198,8 @@ export default function SignalStats() {
               <tbody>
                 {samples.length === 0 && <tr><td colSpan={10} className={styles.emptyTableCell}>
                   <span role="status">{source === "scan" ? "暂无样本，请先开始扫描。" : "暂无已完成的实时告警样本。"}</span></td></tr>}
-                {samples.length > 0 && barrierRows.map(({ stop, take, chase, fade }) => <tr key={`${stop}-${take}`}>
-                  <th scope="row">{stop}% / {take}%</th>
+                {samples.length > 0 && barrierRows.map(({ chase, fade, ...plan }, index) => <tr key={index}>
+                  <th scope="row">{barrierLabel(plan)}</th>
                   <td><Count stats={chase} /></td>
                   <td>{share(chase.winRate)}</td>
                   {average(chase)}
@@ -233,10 +239,10 @@ export default function SignalStats() {
               onChange={(event) => setGroupId(event.target.value)}>
               {SIGNAL_GROUPS.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
             </select>
-            <label htmlFor="signal-barrier">止损 / 止盈</label>
+            <label htmlFor="signal-barrier">出场方式</label>
             <select id="signal-barrier" className={styles.tradingSelect} value={barrier}
               onChange={(event) => setBarrier(Number(event.target.value))}>
-              {barriers.map(({ stop, take }, index) => <option key={index} value={index}>{stop}% / {take}%</option>)}
+              {barriers.map((barrier, index) => <option key={index} value={index}>{barrierLabel(barrier)}</option>)}
             </select>
           </div>
           <div className={styles.tableScroll}>
@@ -289,6 +295,9 @@ export default function SignalStats() {
           </details>
 
           <p>
+            成本「按流动性分档」：当时 24 小时成交额 ≥5 亿每笔 0.14%，1–5 亿 0.2%，2000 万–1 亿 0.3%，更低或未知 0.5%（双边吃单手续费 0.1% 加滑点）。
+            「按波动率」的止损止盈以这个币前 24 小时的 1 小时波动幅度为单位；「保本」在浮盈达到止损距离后把止损移到开仓价；
+            「移动止损」不设止盈，止损跟随最好价格。
             说明：历史扫描用 1 分钟K线找出「{data?.scan.params?.windowMinutes ?? "N"} 分钟内涨跌超过阈值」的异动，在下一分钟开盘价进场，
             同一合约 30 分钟内只取一次；实时告警按告警价进场。同一分钟内同时碰到止损和止盈时按止损计，结果偏保守。
             走势表的收益方向和异动一致，正数表示继续往异动方向走。
