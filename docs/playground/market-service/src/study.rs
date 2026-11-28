@@ -5,6 +5,7 @@
 //! 模拟每种出场方式。盈亏分成价格和资金费两部分，交易成本在页面上按流动性扣除。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -396,11 +397,20 @@ pub struct Study {
     history: Arc<History>,
     stop: watch::Receiver<bool>,
     state: Mutex<Value>,
+    /// 检验结果的保存位置（本地文件），没有本地数据库时为 None。
+    saved: Option<PathBuf>,
 }
 
 impl Study {
-    pub fn new(history: Arc<History>, stop: watch::Receiver<bool>) -> Self {
-        Self { history, stop, state: Mutex::new(json!({"status": "idle"})) }
+    /// `saved` 是检验结果的保存位置：检验完成后写入，服务重启时读回，不用每次重新检验。
+    pub fn new(history: Arc<History>, stop: watch::Receiver<bool>, saved: Option<PathBuf>) -> Self {
+        let state = saved
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|content| serde_json::from_slice::<Value>(&content).ok())
+            .filter(|state| state["status"] == "done" && state["result"].is_object())
+            .unwrap_or_else(|| json!({"status": "idle"}));
+        Self { history, stop, state: Mutex::new(state), saved }
     }
 
     pub async fn snapshot(&self) -> Value {
@@ -420,7 +430,11 @@ impl Study {
         tokio::spawn(async move {
             let history = Arc::clone(&study.history);
             let stop = study.stop.clone();
-            let result = tokio::task::spawn_blocking(move || run(&history, params, now_ms(), || *stop.borrow()))
+            // 检验区间从研究数据的终点往前算，数据没更新时不会因为「今天」往后移而少掉开头几天。
+            let result = tokio::task::spawn_blocking(move || {
+                let end = history.hour_range().ok().and_then(|range| range.1).map_or(now_ms(), |end| end.min(now_ms()));
+                run(&history, params, end, || *stop.borrow())
+            })
                 .await
                 .unwrap_or_else(|_| Err("检验意外中止。".into()));
             let mut state = study.state.lock().await;
@@ -429,6 +443,11 @@ impl Study {
                 Ok(result) => {
                     state["status"] = json!("done");
                     state["result"] = result;
+                    if let Some(path) = &study.saved {
+                        if let Err(error) = crate::store::write_private_json(path, &*state) {
+                            eprintln!("检验结果保存失败：{error}");
+                        }
+                    }
                 }
                 Err(error) => {
                     state["status"] = json!("failed");
@@ -523,6 +542,22 @@ mod tests {
         // 做空只收到中间 5:00 那一次。
         let short = simulate(&bars, &settled, -1.0, 0, PLANS[1], false).unwrap();
         assert!((short.funding - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_saved_study_is_read_back_after_a_restart() {
+        let (_stop, stopped) = watch::channel(false);
+        let path = std::env::temp_dir().join(format!("study-{}.json", uuid::Uuid::new_v4()));
+        let history = Arc::new(History::open_memory().unwrap());
+        // 没有保存过：当作没检验。
+        assert_eq!(Study::new(Arc::clone(&history), stopped.clone(), Some(path.clone())).snapshot().await["status"], "idle");
+        let saved = json!({"status": "done", "finishedAt": 5, "result": {"samples": [], "plans": []}});
+        crate::store::write_private_json(&path, &saved).unwrap();
+        assert_eq!(Study::new(Arc::clone(&history), stopped.clone(), Some(path.clone())).snapshot().await, saved);
+        // 文件损坏或不完整时也当作没检验。
+        std::fs::write(&path, b"{\"status\": \"running\"}").unwrap();
+        assert_eq!(Study::new(history, stopped, Some(path.clone())).snapshot().await["status"], "idle");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

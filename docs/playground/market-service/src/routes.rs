@@ -79,6 +79,8 @@ pub fn router(
         .route("/api/signals/scan", post(signal_scan))
         .route("/api/dataset", get(dataset_status))
         .route("/api/dataset/prepare", post(dataset_prepare))
+        .route("/api/dataset/cancel", post(dataset_cancel))
+        .route("/api/dataset/delete", post(dataset_delete))
         .route("/api/study", get(study_status))
         .route("/api/study/run", post(study_run))
         .route_layer(middleware::from_fn_with_state(token, require_local_token));
@@ -832,6 +834,36 @@ async fn dataset_status(State(state): State<Service>) -> Response {
     }
 }
 
+async fn dataset_cancel(State(state): State<Service>, headers: HeaderMap) -> Response {
+    let Some(dataset) = state.dataset else {
+        return no_store(error(StatusCode::FORBIDDEN, "研究数据集仅在本地设置模式下可用。"));
+    };
+    if !has_json(&headers) {
+        return no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的请求。"));
+    }
+    no_store(Json(json!({"job": dataset.cancel().await})).into_response())
+}
+
+async fn dataset_delete(
+    State(state): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Some(dataset) = state.dataset else {
+        return no_store(error(StatusCode::FORBIDDEN, "研究数据集仅在本地设置模式下可用。"));
+    };
+    if !has_json(&headers) {
+        return no_store(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "需要 JSON 格式的请求。"));
+    }
+    let Some(params) = body.ok().and_then(|Json(value)| serde_json::from_value::<crate::dataset::DeleteParams>(value).ok()) else {
+        return no_store(error(StatusCode::BAD_REQUEST, "请选择要删除的数据。"));
+    };
+    match dataset.delete(params).await {
+        Ok(value) => no_store(Json(value).into_response()),
+        Err(message) => no_store(error(StatusCode::CONFLICT, &message)),
+    }
+}
+
 async fn dataset_prepare(
     State(state): State<Service>,
     headers: HeaderMap,
@@ -1007,6 +1039,8 @@ mod tests {
             ("/api/signals/scan", Method::POST),
             ("/api/dataset", Method::GET),
             ("/api/dataset/prepare", Method::POST),
+            ("/api/dataset/cancel", Method::POST),
+            ("/api/dataset/delete", Method::POST),
             ("/api/study", Method::GET),
             ("/api/study/run", Method::POST),
             ("/api/trading/close", Method::POST),

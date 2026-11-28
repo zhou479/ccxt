@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiUrl } from "@/lib/basePath";
 import { readMarketResponse } from "@/lib/market-response";
-import type { DatasetSnapshot, StudyJob } from "@/lib/study-types";
+import type { DataKind, DatasetSnapshot, StudyJob } from "@/lib/study-types";
 
 const RUNNING_POLL_MS = 5_000;
 const IDLE_POLL_MS = 60_000;
@@ -62,8 +62,20 @@ export function useStudy() {
     };
   }, [mode, refreshKey]);
 
-  const prepare = useCallback(async (days: number) => {
-    await post("/api/dataset/prepare", { days }, "无法开始下载研究数据。");
+  /** 更新研究数据；不传 kind 时是一起下载合约列表、小时K线和资金费率。 */
+  const prepare = useCallback(async (days: number, kind?: DataKind) => {
+    await post("/api/dataset/prepare", kind ? { days, kind } : { days }, "无法开始更新研究数据。");
+    setRefreshKey((key) => key + 1);
+  }, []);
+
+  /** 删除一类研究数据（连同已下载区间）。 */
+  const remove = useCallback(async (kind: DataKind) => {
+    await post("/api/dataset/delete", { kind }, "无法删除数据。");
+    setRefreshKey((key) => key + 1);
+  }, []);
+
+  const cancel = useCallback(async () => {
+    await post("/api/dataset/cancel", {}, "无法停止下载。");
     setRefreshKey((key) => key + 1);
   }, []);
 
@@ -72,5 +84,5 @@ export function useStudy() {
     setRefreshKey((key) => key + 1);
   }, []);
 
-  return { mode, dataset, study, error, prepare, run };
+  return { mode, dataset, study, error, prepare, cancel, remove, run };
 }

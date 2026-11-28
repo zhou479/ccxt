@@ -474,6 +474,7 @@
 
 .strategyHead {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
@@ -575,6 +576,153 @@
   box-shadow: 0 1px 2px hsl(0 0% 0% / 0.08);
 }
 
+.tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.tag_ok {
+  background: hsl(var(--success-bg));
+  color: hsl(var(--success));
+}
+
+.tag_warn {
+  background: hsl(var(--warning-bg));
+  color: hsl(var(--warning));
+}
+
+.tag_bad {
+  background: hsl(var(--destructive-bg));
+  color: hsl(var(--destructive));
+}
+
+.tag_neutral {
+  background: hsl(var(--muted));
+  color: hsl(var(--muted-foreground));
+}
+
+.metricSmall {
+  font-size: 18px;
+}
+
+.cardBody {
+  padding: 12px 16px 16px;
+}
+
+details.card > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.card:not([open]) > summary {
+  border-bottom: 0;
+}
+
+.catalog td {
+  white-space: normal;
+  vertical-align: top;
+  line-height: 1.6;
+}
+
+.catalog td:first-child {
+  white-space: nowrap;
+}
+
+.catalog td:nth-child(3) {
+  min-width: 160px;
+}
+
+.rowActions {
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.rowActions .button {
+  height: 28px;
+  padding: 0 10px;
+}
+
+.timelineBox {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timeline {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.timelineSegment {
+  height: 100%;
+}
+
+.regime_bull {
+  background: hsl(var(--success));
+}
+
+.regime_bear {
+  background: hsl(var(--destructive));
+}
+
+.regime_range {
+  background: hsl(var(--muted-foreground) / 0.45);
+}
+
+.timelineAxis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legendDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.validateHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.select {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius);
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 13px;
+}
+
 .verdict {
   margin: 0;
   padding: 6px 10px;
@@ -582,6 +730,11 @@
   font-size: 12px;
   background: hsl(var(--warning-bg));
   color: hsl(var(--warning));
+}
+
+.verdictBad {
+  background: hsl(var(--destructive-bg));
+  color: hsl(var(--destructive));
 }
 
 .verdictPassed {

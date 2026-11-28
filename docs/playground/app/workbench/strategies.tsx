@@ -3,45 +3,25 @@
 import { useState } from "react";
 import type { BackgroundMonitorStatus, BackgroundRule } from "@/lib/background-monitor-types";
 import { STRATEGY_KIND_LABELS, type StrategyCard } from "@/lib/strategy-list";
-import FundingStudy from "../markets/funding-study";
 import MarketMonitor from "../markets/market-monitor";
-import SignalStats from "../markets/signal-stats";
 import styles from "./workbench.module.css";
 
 type Props = {
   cards: StrategyCard[];
   monitor: { data: BackgroundMonitorStatus | null; saving: boolean; error: string; save: (rule: BackgroundRule) => Promise<void> };
-  blocked: string | null;
-  onOpenSettings: () => void;
 };
 
-/** 某个策略详情里的一个分类。新增策略时在这里加上它自己的参数、记录和检验结果。 */
-function StrategyDetail({ strategy, section }: { strategy: string; section: string }) {
-  if (strategy === "spike-monitor") {
-    if (section === "settings") return <MarketMonitor section="strategy" contracts={undefined} coinCount={null} directoryError={false} />;
-    if (section === "records") return <MarketMonitor section="records" contracts={undefined} coinCount={null} directoryError={false} />;
-    if (section === "signals") return <SignalStats defaultOpen />;
-  }
-  if (strategy === "funding-rate" && section === "study") return <FundingStudy withDataset={false} defaultOpen />;
-  return null;
-}
-
-/** 策略页：每个策略一张卡片，显示类型、状态、检验结论和今日数据；可以直接启停，或打开详情查看参数、记录和检验结果。 */
-export default function Strategies({ cards, monitor, blocked, onOpenSettings }: Props) {
-  const [open, setOpen] = useState<{ strategy: string; section: string } | null>(null);
+/** 策略页：每个策略一张卡片，显示类型、状态和今日数据；可以直接启停，或展开参数设置。 */
+export default function Strategies({ cards, monitor }: Props) {
+  const [editing, setEditing] = useState<string | null>(null);
   const [message, setMessage] = useState("");
-  const opened = cards.find((card) => card.id === open?.strategy);
-
-  function show(card: StrategyCard, section = card.details[0]?.id) {
-    setOpen(section ? { strategy: card.id, section } : null);
-  }
 
   function toggle(card: StrategyCard) {
     setMessage("");
     if (card.id !== "spike-monitor") return;
     const rule = monitor.data?.configured ? monitor.data.rule : null;
     if (!rule) {
-      show(card, "settings");
+      setEditing(card.id);
       setMessage("异动监控策略还没有保存过规则，请先在下面设置参数并保存，再启用。");
       return;
     }
@@ -54,7 +34,6 @@ export default function Strategies({ cards, monitor, blocked, onOpenSettings }: 
 
   return (
     <>
-      {blocked && <p className={`${styles.notice} ${styles.noticeBad}`}>交易保护：{blocked} 自动交易策略暂时不能开新仓。</p>}
       {(message || monitor.error) && <p className={`${styles.notice} ${monitor.error ? styles.noticeBad : ""}`} role="status">{monitor.error || message}</p>}
       <div className={styles.strategyGrid}>
         {cards.map((card) => (
@@ -74,32 +53,15 @@ export default function Strategies({ cards, monitor, blocked, onOpenSettings }: 
             <dl className={styles.strategyStats}>
               {card.stats.map((stat) => <div key={stat.label}><dt>{stat.label}</dt><dd>{stat.value}</dd></div>)}
             </dl>
-            {card.verdict && <p className={`${styles.verdict} ${card.verdict.passed ? styles.verdictPassed : ""}`}>{card.verdict.text}</p>}
-            <div className={styles.strategyActions}>
-              {card.details.length > 0 && <button type="button" className={styles.button}
-                onClick={() => (open?.strategy === card.id ? setOpen(null) : show(card))}>{open?.strategy === card.id ? "收起详情" : "查看详情"}</button>}
-              {card.kind === "manual" && <button type="button" className={styles.button} onClick={onOpenSettings}>去下单</button>}
-            </div>
+            {card.details.length > 0 && <div className={styles.strategyActions}>
+              <button type="button" className={styles.button} onClick={() => setEditing(editing === card.id ? null : card.id)}>
+                {editing === card.id ? "收起参数" : "参数设置"}</button>
+            </div>}
           </section>
         ))}
       </div>
-      {opened && open && <section className={styles.detail} aria-label={`${opened.name}详情`}>
-        <div className={styles.detailHead}>
-          <h3 className={styles.cardTitle}>{opened.name}</h3>
-          <div className={styles.subTabs} role="group" aria-label={`${opened.name}详情分类`}>
-            {opened.details.map(({ id, label }) => (
-              <button key={id} type="button" aria-pressed={open.section === id}
-                className={`${styles.subTab} ${open.section === id ? styles.subTabActive : ""}`}
-                onClick={() => setOpen({ strategy: opened.id, section: id })}>{label}</button>
-            ))}
-          </div>
-        </div>
-        <StrategyDetail strategy={opened.id} section={open.section} />
-      </section>}
-      <p className={styles.hint}>
-        停止策略只是不再开新仓或不再告警，已有仓位继续由止损止盈和最长持仓时间管理；需要马上平掉全部仓位，请用总览页的「一键全平」。
-        每个策略都有自己的卡片，没通过历史检验的交易策略不能启用；以后的趋势、网格等策略也会加在这里。
-      </p>
+      {editing === "spike-monitor" && <MarketMonitor section="strategy" contracts={undefined} coinCount={null} directoryError={false} />}
+      <p className={styles.hint}>停止策略只是不再告警（或不再开新仓），已有仓位继续由止损止盈和最长持仓时间管理；需要马上平掉全部仓位，请用总览页的「一键全平」。</p>
     </>
   );
 }

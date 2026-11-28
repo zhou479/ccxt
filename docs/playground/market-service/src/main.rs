@@ -83,7 +83,9 @@ async fn main() -> store::Result<()> {
         .as_ref()
         .map(|history| dataset::Dataset::new(Arc::clone(history), stopped.clone()).map(Arc::new))
         .transpose()?;
-    let study = history.as_ref().map(|history| Arc::new(study::Study::new(Arc::clone(history), stopped.clone())));
+    let study = history.as_ref().zip(store.as_ref()).map(|(history, store)| {
+        Arc::new(study::Study::new(Arc::clone(history), stopped.clone(), Some(store.study_path())))
+    });
     // Data Binance keeps only briefly (or never) is archived for later factor research.
     let archiving = history
         .filter(|_| archive::enabled())

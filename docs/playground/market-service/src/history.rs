@@ -6,7 +6,7 @@
 //!   币安的持仓量和多空比只保留约 30 天、强平推送没有历史，所以要自己存。
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -78,7 +78,18 @@ pub struct Liquidation {
     pub quantity: f64,
 }
 
-pub struct History(Mutex<Connection>);
+pub struct History {
+    db: Mutex<Connection>,
+    /// 统计数字要数上千万行，页面又会频繁刷新，所以缓存一段时间。
+    status: Mutex<Option<(std::time::Instant, Value)>>,
+    /// 后台正在重新数，避免同时开好几个。
+    refreshing: std::sync::atomic::AtomicBool,
+    /// 数据库文件位置，数数时另开一个只读连接，不占用主连接；内存数据库（测试）为 None。
+    path: Option<std::path::PathBuf>,
+}
+
+/// 统计数字的缓存时长。
+const STATUS_CACHE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl History {
     pub fn open(path: &Path) -> Result<Self> {
@@ -127,7 +138,8 @@ impl History {
                 id INTEGER PRIMARY KEY, start INTEGER NOT NULL, end INTEGER NOT NULL
             );",
         )?;
-        Ok(Self(Mutex::new(db)))
+        let path = (path != Path::new(":memory:")).then(|| path.to_path_buf());
+        Ok(Self { db: Mutex::new(db), status: Mutex::new(None), refreshing: std::sync::atomic::AtomicBool::new(false), path })
     }
 
     #[cfg(test)]
@@ -136,7 +148,7 @@ impl History {
     }
 
     fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.0.lock().map_err(|_| "history database lock poisoned".into())
+        self.db.lock().map_err(|_| "history database lock poisoned".into())
     }
 
     /// The range already downloaded for a symbol, `[start, end)`.
@@ -159,6 +171,7 @@ impl History {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save_bars(&self, symbol: &str, bars: &[Bar]) -> Result<()> {
         self.save_candles(Kind::Klines, symbol, bars)
     }
@@ -178,6 +191,7 @@ impl History {
     }
 
     /// One-minute bars starting in `[start, end)`, oldest first.
+    #[cfg(test)]
     pub fn bars(&self, symbol: &str, start: i64, end: i64) -> Result<Vec<Bar>> {
         self.candles(Kind::Klines, symbol, start, end)
     }
@@ -336,9 +350,91 @@ impl History {
         Ok(Some((buy, sell)))
     }
 
-    /// Counts and latest times for the page.
+    /// 研究数据的时间范围：起点不算 BTC 为 200 日均线多下载的部分，终点是最后一根小时K线的结束时间。
+    pub fn hour_range(&self) -> Result<(Option<i64>, Option<i64>)> {
+        Ok(self.db()?.query_row(
+            "SELECT MIN(CASE WHEN symbol != 'BTCUSDT' THEN time END), MAX(time) + 3600000 FROM kline_1h",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    /// 页面用的统计数字，不让页面等待：有旧结果就先返回旧的，过期了在后台重新数；
+    /// 第一次没有结果时才在后台线程里数完再返回。数数要扫描上千万行，放在后台不会卡住其他请求。
+    pub async fn status_in_background(self: &Arc<Self>) -> Option<Value> {
+        let cached = self.status.lock().ok().and_then(|cache| cache.as_ref().map(|(at, value)| (at.elapsed() < STATUS_CACHE, value.clone())));
+        match cached {
+            Some((fresh, value)) => {
+                if !fresh && !self.refreshing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    let history = Arc::clone(self);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = history.refresh_status();
+                        history.refreshing.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                }
+                Some(value)
+            }
+            None => {
+                let history = Arc::clone(self);
+                tokio::task::spawn_blocking(move || history.refresh_status().ok()).await.ok().flatten()
+            }
+        }
+    }
+
+    /// 数据有变动（更新完成、删除）时清掉缓存，下次读取会重新数。
+    pub fn invalidate_status(&self) {
+        if let Ok(mut cache) = self.status.lock() {
+            *cache = None;
+        }
+    }
+
+    /// 在一个事务里执行删除语句（研究数据「删除」用）。
+    pub fn delete_rows(&self, statements: &[&str]) -> Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        for statement in statements {
+            tx.execute(statement, [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 重新数一遍并更新缓存。
+    fn refresh_status(&self) -> Result<Value> {
+        let value = self.compute_status()?;
+        if let Ok(mut cache) = self.status.lock() {
+            *cache = Some((std::time::Instant::now(), value.clone()));
+        }
+        Ok(value)
+    }
+
+    /// 页面用的统计数字，最多缓存一分钟（同步版本，会等数完）。
+    #[cfg(test)]
     pub fn status(&self) -> Result<Value> {
-        let db = self.db()?;
+        let mut cache = self.status.lock().map_err(|_| "history status lock poisoned")?;
+        if let Some((at, value)) = cache.as_ref() {
+            if at.elapsed() < STATUS_CACHE {
+                return Ok(value.clone());
+            }
+        }
+        let value = self.compute_status()?;
+        *cache = Some((std::time::Instant::now(), value.clone()));
+        Ok(value)
+    }
+
+    /// 重新数一遍各类数据（要扫描整张表，较慢）。
+    fn compute_status(&self) -> Result<Value> {
+        match &self.path {
+            Some(path) => {
+                let reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                reader.busy_timeout(std::time::Duration::from_secs(5))?;
+                Self::count_all(&reader)
+            }
+            None => Self::count_all(&*self.db()?),
+        }
+    }
+
+    fn count_all(db: &Connection) -> Result<Value> {
         let count = |sql: &str| -> rusqlite::Result<(i64, Option<i64>)> {
             db.query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
         };
@@ -347,7 +443,13 @@ impl History {
         let long_short = count("SELECT COUNT(DISTINCT symbol), MAX(time) FROM long_short_5m")?;
         let klines = count("SELECT COUNT(*), MAX(time) FROM kline_1m")?;
         let hours = count("SELECT COUNT(*), MAX(time) FROM kline_1h")?;
+        let range: (Option<i64>, Option<i64>) = db.query_row(
+            "SELECT MIN(CASE WHEN symbol != 'BTCUSDT' THEN time END), MAX(time) + 3600000 FROM kline_1h",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         let funding = count("SELECT COUNT(*), MAX(time) FROM funding")?;
+        let open_interest = count("SELECT COUNT(*), MAX(time) FROM open_interest_5m")?;
         let contracts = count("SELECT COUNT(*), MAX(delisted) FROM contract_list")?;
         let delisted = count("SELECT COUNT(*), MAX(delisted) FROM contract_list WHERE status != 'TRADING'")?;
         let session = count("SELECT COUNT(*), MAX(end) FROM stream_session")?;
@@ -356,7 +458,9 @@ impl History {
             "liquidations": liquidations.0, "liquidationAt": liquidations.1,
             "longShortSymbols": long_short.0, "longShortAt": long_short.1,
             "cachedBars": klines.0,
-            "hourBars": hours.0, "fundingPoints": funding.0,
+            "hourBars": hours.0, "fundingPoints": funding.0, "openInterestPoints": open_interest.0,
+            "cachedBarsAt": klines.1,
+            "hourFrom": range.0, "hourTo": range.1,
             "contracts": contracts.0, "delistedContracts": delisted.0,
             "streamAt": session.1,
         }))
@@ -423,5 +527,12 @@ mod tests {
         history.touch_session(session, 10_000).unwrap();
         assert_eq!(history.liquidations("BTCUSDT", 0, 5_000).unwrap(), Some((200.0, 200.0)));
         assert_eq!(history.status().unwrap()["liquidations"], 3);
+        // 研究数据的起点不算 BTC 为均线多下载的部分，终点是最后一根小时K线的结束时间。
+        history.save_candles(Kind::HourKlines, "ETHUSDT", &[Bar { time: 5 * HOUR, end: 6 * HOUR, ..bar(0) }]).unwrap();
+        // 统计数字有一分钟缓存：缓存里还是保存 ETH 之前的结果，重新数才是新的。
+        assert_eq!(history.status().unwrap()["hourFrom"], Value::Null);
+        let status = history.compute_status().unwrap();
+        assert_eq!(status["hourFrom"], 5 * HOUR);
+        assert_eq!(status["hourTo"], 6 * HOUR);
     }
 }

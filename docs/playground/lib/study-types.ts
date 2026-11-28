@@ -61,8 +61,14 @@ export type StudyJob = {
   result?: StudyResult;
 };
 
+/** 研究数据的种类，和后端 dataset.rs 的 DataKind 一一对应。 */
+export type DataKind = "contracts" | "hourly" | "funding" | "minute" | "openInterest" | "premium" | "liquidation" | "longShort";
+
 export type DatasetJob = {
-  status: "idle" | "running" | "done" | "failed" | "interrupted";
+  /** 正在更新的数据种类；「all」是一起下载合约列表、小时K线和资金费率。 */
+  kind?: DataKind | "all";
+  label?: string;
+  status: "idle" | "running" | "done" | "failed" | "interrupted" | "stopped";
   startedAt?: number;
   finishedAt?: number;
   days?: number;
@@ -77,6 +83,19 @@ export type DatasetJob = {
 
 export type DatasetSnapshot = {
   job: DatasetJob;
-  summary: { hourBars?: number; fundingPoints?: number; contracts?: number; delistedContracts?: number } | null;
+  summary: {
+    hourBars?: number; fundingPoints?: number; contracts?: number; delistedContracts?: number;
+    /** 研究数据的时间范围（不含 BTC 为均线多下载的部分）。 */
+    hourFrom?: number | null; hourTo?: number | null;
+    /** 异动追单检验用的 1 分钟K线缓存。 */
+    cachedBars?: number;
+    cachedBarsAt?: number | null;
+    /** 5 分钟持仓量（币安只保留约 30 天，程序自己存档）。 */
+    openInterestPoints?: number;
+    /** 程序自己存档的资金费率快照次数、强平单数量、多空比合约数。 */
+    premiumSnapshots?: number;
+    liquidations?: number;
+    longShortSymbols?: number;
+  } | null;
   regimes: { start: number; end: number; regime: Regime }[];
 };

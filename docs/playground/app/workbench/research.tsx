@@ -2,8 +2,8 @@
 
 import { useState } from "react";
 import CoinResearch from "../markets/coin-research";
-import { DatasetPanel } from "../markets/funding-study";
 import { useMarketDirectory } from "../markets/use-market-directory";
+import ResearchData from "./research-data";
 import styles from "./workbench.module.css";
 
 const SECTIONS = [
@@ -20,10 +20,7 @@ function MarketLookup() {
   return <CoinResearch binance={binance} okx={okx} />;
 }
 
-/**
- * 研究页：不属于某个策略的通用工具——看行情、准备历史检验用的研究数据。
- * 每个策略自己的记录和检验结果（异动监控的信号统计、资金费率的历史检验）放在策略页它的卡片详情里。
- */
+/** 研究页：看行情、管理本地的研究数据。 */
 export default function Research() {
   const [section, setSection] = useState<Section>("market");
   return (
@@ -35,7 +32,7 @@ export default function Research() {
         ))}
       </div>
       {section === "market" && <MarketLookup />}
-      {section === "data" && <DatasetPanel />}
+      {section === "data" && <ResearchData />}
     </>
   );
 }

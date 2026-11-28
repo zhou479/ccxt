@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { apiUrl } from "@/lib/basePath";
 import { runningSummary, strategyCards } from "@/lib/strategy-list";
-import { studySummary } from "@/lib/study-stats";
 import { tradingModeLabels } from "@/lib/trading-types";
 import BinanceSettings from "../markets/binance-settings";
 import DingTalkSettings from "../markets/dingtalk-settings";
@@ -11,8 +10,8 @@ import TestStrategy from "../markets/test-strategy";
 import TradeRecords from "../markets/trade-records";
 import { useBackgroundMonitor } from "../markets/use-background-monitor";
 import { useStrategyNotifications } from "../markets/use-strategy-notifications";
-import { useStudy } from "../markets/use-study";
 import { useTrading } from "../markets/use-trading";
+import MonitorCenter from "./monitor-center";
 import Overview from "./overview";
 import Research from "./research";
 import Strategies from "./strategies";
@@ -21,6 +20,7 @@ import styles from "./workbench.module.css";
 
 const TABS = [
   { id: "overview", label: "总览" },
+  { id: "monitor", label: "异动监控中心" },
   { id: "strategies", label: "策略" },
   { id: "research", label: "研究" },
   { id: "settings", label: "设置" },
@@ -28,21 +28,14 @@ const TABS = [
 
 type Tab = (typeof TABS)[number]["id"];
 
-/** 工作台：总览（资金、盈亏、持仓）、策略（每个策略的启停、参数、记录和检验）、研究（行情查询、研究数据）、设置（账号、通知、测试下单、记录）。 */
+/** 工作台：总览（资金、盈亏、持仓）、异动监控中心、策略（启停和参数）、研究（行情查询、研究数据）、设置（账号、通知、测试下单、记录）。 */
 export default function Workbench() {
   const [tab, setTab] = useState<Tab>("overview");
   const trading = useTrading();
   const overview = useOverview(tab === "overview");
   const notifications = useStrategyNotifications();
   const monitor = useBackgroundMonitor();
-  const study = useStudy();
-  const studyResult = study.study?.result;
-  const funding = useMemo(() => ({
-    summary: studyResult ? studySummary(studyResult.samples, studyResult.from, studyResult.to) : null,
-    studying: study.study?.status === "running",
-  }), [studyResult, study.study?.status]);
-  const cards = useMemo(() => strategyCards(monitor.data, trading.data?.trades ?? [], Date.now(), funding),
-    [monitor.data, trading.data, funding]);
+  const cards = useMemo(() => strategyCards(monitor.data, Date.now()), [monitor.data]);
 
   // 分页记在地址栏的 #，刷新、前进后退或手动改地址后都停在对应的页。
   useEffect(() => {
@@ -90,8 +83,9 @@ export default function Workbench() {
           error={trading.error || overview.error} onCloseAll={trading.closeAll} onResume={trading.resume}
           strategies={runningSummary(cards)} onOpenSettings={() => open("settings")} onOpenStrategies={() => open("strategies")} />}
 
-        {tab === "strategies" && <Strategies cards={cards} monitor={monitor} blocked={status?.guard?.blocked ?? null}
-          onOpenSettings={() => open("settings")} />}
+        {tab === "monitor" && <MonitorCenter monitor={monitor} onOpenStrategies={() => open("strategies")} />}
+
+        {tab === "strategies" && <Strategies cards={cards} monitor={monitor} />}
 
         {tab === "research" && <Research />}
 

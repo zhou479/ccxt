@@ -7,14 +7,14 @@ type RustMarketRoute = "/api/markets/contracts" | "/api/markets/alert-context" |
   TradingRoute | SignalRoute | DatasetRoute;
 type StudyRoute = "/api/study" | "/api/study/run";
 type SignalRoute = "/api/signals" | "/api/signals/scan";
-type DatasetRoute = "/api/dataset" | "/api/dataset/prepare" | StudyRoute;
+type DatasetRoute = "/api/dataset" | "/api/dataset/prepare" | "/api/dataset/cancel" | "/api/dataset/delete" | StudyRoute;
 type TradingRoute = "/api/trading" | "/api/trading/account" | "/api/trading/test-order" | "/api/trading/close" |
   "/api/trading/close-all" | "/api/trading/resume" | "/api/trading/overview";
 const localRoutes = new Set<RustMarketRoute>([
   "/api/markets/background-monitor", "/api/strategy-notifications",
   "/api/trading", "/api/trading/account", "/api/trading/test-order", "/api/trading/close",
   "/api/trading/close-all", "/api/trading/resume", "/api/trading/overview",
-  "/api/signals", "/api/signals/scan", "/api/dataset", "/api/dataset/prepare",
+  "/api/signals", "/api/signals/scan", "/api/dataset", "/api/dataset/prepare", "/api/dataset/cancel", "/api/dataset/delete",
   "/api/study", "/api/study/run",
 ]);
 

@@ -6,6 +6,7 @@
 //! - 行情阶段按 BTC 日收盘价和 200 日均线划分，只用当天及以前的数据，次日起生效。
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,11 @@ const DAY: i64 = 24 * HOUR;
 const NO_DELIVERY: i64 = 4_133_404_800_000;
 const MIN_DAYS: i64 = 30;
 const MAX_DAYS: i64 = 1_095;
+/// 1 分钟K线和持仓量只下载成交额最靠前的这么多个合约。
+const MINUTE_TOP: usize = 100;
+const MINUTE_MAX_DAYS: i64 = 30;
+/// 币安的持仓量历史只保留约 30 天。
+const OPEN_INTEREST_DAYS: i64 = 29;
 /// 区分牛熊的 BTC 均线天数。
 const REGIME_AVERAGE: usize = 200;
 /// 均线上升或下降：和这么多天前的均线值比较。
@@ -54,25 +60,111 @@ impl Regime {
     }
 }
 
+/// 研究数据的种类。`All` 是旧的「一起下载」：合约列表 + 小时K线 + 资金费率。
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DataKind {
+    #[default]
+    All,
+    Contracts,
+    Hourly,
+    Funding,
+    Minute,
+    OpenInterest,
+    Premium,
+    Liquidation,
+    LongShort,
+}
+
+impl DataKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            DataKind::All => "all",
+            DataKind::Contracts => "contracts",
+            DataKind::Hourly => "hourly",
+            DataKind::Funding => "funding",
+            DataKind::Minute => "minute",
+            DataKind::OpenInterest => "openInterest",
+            DataKind::Premium => "premium",
+            DataKind::Liquidation => "liquidation",
+            DataKind::LongShort => "longShort",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DataKind::All => "研究数据",
+            DataKind::Contracts => "合约列表",
+            DataKind::Hourly => "小时K线",
+            DataKind::Funding => "资金费率",
+            DataKind::Minute => "1 分钟K线",
+            DataKind::OpenInterest => "持仓量",
+            DataKind::Premium => "资金费率快照",
+            DataKind::Liquidation => "强平单",
+            DataKind::LongShort => "多空比",
+        }
+    }
+
+    /// 存档类数据由程序运行时自动记录，不能手动「更新」。
+    fn updatable(self) -> bool {
+        !matches!(self, DataKind::Premium | DataKind::Liquidation | DataKind::LongShort)
+    }
+
+    /// 删除这类数据要执行的语句（连同「已下载区间」一起删，下次更新会重新下载）。
+    fn delete_statements(self) -> &'static [&'static str] {
+        match self {
+            DataKind::All => &[],
+            DataKind::Contracts => &["DELETE FROM contract_list"],
+            DataKind::Hourly => &["DELETE FROM kline_1h", "DELETE FROM coverage WHERE kind = 'kline_1h'"],
+            DataKind::Funding => &["DELETE FROM funding", "DELETE FROM coverage WHERE kind = 'funding'"],
+            DataKind::Minute => &["DELETE FROM kline_1m", "DELETE FROM coverage WHERE kind = 'kline_1m'"],
+            DataKind::OpenInterest => &["DELETE FROM open_interest_5m", "DELETE FROM coverage WHERE kind = 'open_interest_5m'"],
+            DataKind::Premium => &["DELETE FROM premium_5m"],
+            DataKind::Liquidation => &["DELETE FROM liquidation", "DELETE FROM stream_session"],
+            DataKind::LongShort => &["DELETE FROM long_short_5m"],
+        }
+    }
+}
+
+fn default_days() -> i64 {
+    730
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct PrepareParams {
+    #[serde(default = "default_days")]
     pub days: i64,
+    #[serde(default)]
+    pub kind: DataKind,
 }
 
 impl PrepareParams {
     fn validate(self) -> Result<Self, String> {
-        if !(MIN_DAYS..=MAX_DAYS).contains(&self.days) {
-            return Err(format!("数据天数需在 {MIN_DAYS}–{MAX_DAYS} 天之间。"));
+        if !self.kind.updatable() {
+            return Err(format!("{}由程序运行时自动记录，不能手动更新。", self.kind.label()));
+        }
+        let range = if self.kind == DataKind::Minute { 1..=MINUTE_MAX_DAYS } else { MIN_DAYS..=MAX_DAYS };
+        if matches!(self.kind, DataKind::All | DataKind::Hourly | DataKind::Funding | DataKind::Minute) && !range.contains(&self.days) {
+            return Err(format!("数据天数需在 {}–{} 天之间。", range.start(), range.end()));
         }
         Ok(self)
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct DeleteParams {
+    pub kind: DataKind,
 }
 
 pub struct Dataset {
     fetch: Fetcher,
     client: reqwest::Client,
     state: Mutex<Value>,
+    /// 用户点了「停止下载」：下载完当前合约就停下，已下载的部分保留，下次接着下。
+    cancel: AtomicBool,
 }
+
+const STOPPED_MESSAGE: &str = "已取消更新。已下载的部分保留在本地，再点「更新」会接着下。";
 
 impl Dataset {
     pub fn new(history: Arc<History>, stop: watch::Receiver<bool>) -> crate::store::Result<Self> {
@@ -80,7 +172,12 @@ impl Dataset {
             .user_agent(crate::HTTP_USER_AGENT)
             .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { fetch: Fetcher::new(history, stop, DATASET_GAP), client, state: Mutex::new(json!({"status": "idle"})) })
+        Ok(Self {
+            fetch: Fetcher::new(history, stop, DATASET_GAP),
+            client,
+            state: Mutex::new(json!({"status": "idle"})),
+            cancel: AtomicBool::new(false),
+        })
     }
 
     pub async fn snapshot(&self) -> Result<Value, String> {
@@ -89,7 +186,7 @@ impl Dataset {
         let regimes = segments(&regimes(&daily_closes(&btc)));
         Ok(json!({
             "job": self.state.lock().await.clone(),
-            "summary": history.status().ok(),
+            "summary": self.fetch.shared_history().status_in_background().await,
             "regimes": regimes,
         }))
     }
@@ -103,18 +200,28 @@ impl Dataset {
             }
             *state = json!({
                 "status": "running", "startedAt": now_ms(), "days": params.days,
+                "kind": params.kind.key(), "label": params.kind.label(),
                 "done": 0, "total": 0, "skipped": 0, "failed": [], "failedCount": 0,
             });
+            self.cancel.store(false, Ordering::Relaxed);
         }
         let dataset = Arc::clone(self);
         tokio::spawn(async move {
-            let result = dataset.prepare(params.days).await;
+            let result = dataset.prepare(params.kind, params.days).await;
+            // 更新完马上重新数，页面上的数量不用等一分钟。
+            dataset.fetch.history().invalidate_status();
             let mut state = dataset.state.lock().await;
             state["finishedAt"] = json!(now_ms());
             match result {
                 Ok(()) => state["status"] = json!("done"),
                 Err(error) => {
-                    state["status"] = json!(if dataset.fetch.stopped() { "interrupted" } else { "failed" });
+                    state["status"] = json!(if dataset.cancel.load(Ordering::Relaxed) {
+                        "stopped"
+                    } else if dataset.fetch.stopped() {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    });
                     state["error"] = json!(error);
                 }
             }
@@ -122,13 +229,68 @@ impl Dataset {
         Ok(self.state.lock().await.clone())
     }
 
+    /// 停止正在进行的下载：当前合约下载完就停，不会留下半截数据。
+    pub async fn cancel(&self) -> Value {
+        if self.state.lock().await["status"] == "running" {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+        self.state.lock().await.clone()
+    }
+
     async fn update(&self, change: impl FnOnce(&mut Value)) {
         change(&mut *self.state.lock().await);
     }
 
-    async fn prepare(&self, days: i64) -> Result<(), String> {
-        let now = now_ms();
-        let from = now - days * DAY;
+    /// 删除一类数据（连同已下载区间），下次更新会重新下载。正在更新时不能删除。
+    pub async fn delete(&self, params: DeleteParams) -> Result<Value, String> {
+        if params.kind == DataKind::All {
+            return Err("请选择要删除的数据。".into());
+        }
+        if self.state.lock().await["status"] == "running" {
+            return Err("正在更新数据，请先取消更新再删除。".into());
+        }
+        let history = self.fetch.shared_history();
+        let statements = params.kind.delete_statements();
+        tokio::task::spawn_blocking(move || history.delete_rows(statements))
+            .await
+            .map_err(|_| "删除意外中止。".to_owned())?
+            .map_err(|_| "删除失败，请稍后重试。".to_owned())?;
+        self.fetch.history().invalidate_status();
+        Ok(json!({"deleted": params.kind.key()}))
+    }
+
+    /// 检查是否该停：服务关闭或用户取消更新。
+    fn interrupted(&self) -> Option<String> {
+        if self.fetch.stopped() {
+            Some("服务正在关闭，更新已停止。".into())
+        } else if self.cancel.load(Ordering::Relaxed) {
+            Some(STOPPED_MESSAGE.into())
+        } else {
+            None
+        }
+    }
+
+    /// 记录一个合约的结果，并推进进度。
+    async fn record(&self, index: usize, symbol: &str, result: Result<(), String>) {
+        if let Err(error) = result {
+            let symbol = symbol.to_owned();
+            self.update(|state| {
+                state["failedCount"] = json!(state["failedCount"].as_i64().unwrap_or(0) + 1);
+                if let Some(failed) = state["failed"].as_array_mut().filter(|list| list.len() < MAX_FAILED_SHOWN) {
+                    failed.push(json!({"symbol": symbol, "error": error}));
+                }
+            })
+            .await;
+        }
+        self.update(|state| state["done"] = json!(index + 1)).await;
+    }
+
+    async fn skip(&self) {
+        self.update(|state| state["skipped"] = json!(state["skipped"].as_i64().unwrap_or(0) + 1)).await;
+    }
+
+    /// 从交易所列表和公开数据仓库重新整理合约全集，并保存。
+    async fn refresh_universe(&self) -> Result<Vec<Contract>, String> {
         let info: Value = self.fetch.get(Endpoint::ExchangeInfo, json!({})).await?;
         let archived = match self.archived_symbols().await {
             Ok(symbols) => symbols,
@@ -137,58 +299,114 @@ impl Dataset {
                 Vec::new()
             }
         };
-        let mut contracts = universe(&info, &archived);
+        let contracts = universe(&info, &archived);
         if contracts.is_empty() {
             return Err("币安合约列表为空。".into());
         }
-        let total = contracts.len();
-        self.update(|state| state["total"] = json!(total)).await;
-        // 先保存一次：下载中断时仍有可用的合约全集。只在公开数据仓库里的合约，结束时再补上最后交易时间。
         self.fetch.history().save_contracts(&contracts).map_err(|_| "无法保存合约列表。".to_owned())?;
-        // BTC 要多下载一段，用来计算 200 日均线。
-        let regime_from = from - (REGIME_AVERAGE + REGIME_SLOPE + 10) as i64 * DAY;
-        self.fetch.cached_candles("BTCUSDT", Kind::HourKlines, regime_from, now).await?;
-        for index in 0..contracts.len() {
-            if self.fetch.stopped() {
-                return Err("服务正在关闭，下载已停止。".into());
-            }
-            let contract = &contracts[index];
-            let start = contract.onboard.map_or(from, |onboard| from.max(onboard.div_euclid(HOUR) * HOUR));
-            let end = contract.delisted.map_or(now, |delisted| delisted.min(now));
-            if end <= start {
-                self.update(|state| state["skipped"] = json!(state["skipped"].as_i64().unwrap_or(0) + 1)).await;
-            } else {
-                match self.download(contract, start, end).await {
-                    Ok(last_trade) => {
-                        // 只在公开数据仓库里的合约，以最后一根有成交的K线作为下架时间。
-                        if contract.delisted.is_none() && contract.status != "TRADING" {
-                            contracts[index].delisted = last_trade;
-                        }
-                    }
-                    Err(error) => {
-                        let symbol = contract.symbol.clone();
-                        self.update(|state| {
-                            state["failedCount"] = json!(state["failedCount"].as_i64().unwrap_or(0) + 1);
-                            if let Some(failed) = state["failed"].as_array_mut().filter(|list| list.len() < MAX_FAILED_SHOWN) {
-                                failed.push(json!({"symbol": symbol, "error": error}));
-                            }
-                        })
-                        .await;
-                    }
-                }
-            }
-            self.update(|state| state["done"] = json!(index + 1)).await;
-        }
-        self.fetch.history().save_contracts(&contracts).map_err(|_| "无法保存合约列表。".to_owned())
+        Ok(contracts)
     }
 
-    /// 下载小时K线和资金费率，返回合约最后一次有成交的时间。
-    async fn download(&self, contract: &Contract, start: i64, end: i64) -> Result<Option<i64>, String> {
-        let bars = self.fetch.cached_candles(&contract.symbol, Kind::HourKlines, start, end).await?;
+    /// 本地的合约全集；还没有时先整理一次。
+    async fn contracts(&self) -> Result<Vec<Contract>, String> {
+        let saved = self.fetch.history().contracts().map_err(|_| "无法读取合约列表。".to_owned())?;
+        if saved.is_empty() { self.refresh_universe().await } else { Ok(saved) }
+    }
+
+    /// 现在 24 小时成交额最靠前的合约（1 分钟K线和持仓量只下载这些）。
+    async fn top_contracts(&self, count: usize) -> Result<Vec<String>, String> {
+        let listed: HashSet<String> = self.fetch.listed().await?.into_iter().collect();
+        let tickers: Vec<Value> = self.fetch.get(Endpoint::Ticker, json!({})).await?;
+        let mut ranked: Vec<(String, f64)> = tickers
+            .iter()
+            .filter_map(|ticker| {
+                let symbol = ticker["symbol"].as_str()?;
+                listed.contains(symbol).then(|| (symbol.to_owned(), crate::binance::number(&ticker["quoteVolume"]).unwrap_or(0.0)))
+            })
+            .collect();
+        ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+        ranked.truncate(count);
+        Ok(ranked.into_iter().map(|(symbol, _)| symbol).collect())
+    }
+
+    async fn prepare(&self, kind: DataKind, days: i64) -> Result<(), String> {
+        let now = now_ms();
+        let from = now - days * DAY;
+        match kind {
+            DataKind::Contracts => {
+                self.update(|state| state["total"] = json!(1)).await;
+                self.refresh_universe().await?;
+                self.update(|state| state["done"] = json!(1)).await;
+                Ok(())
+            }
+            DataKind::All | DataKind::Hourly | DataKind::Funding => {
+                let mut contracts = if kind == DataKind::All { self.refresh_universe().await? } else { self.contracts().await? };
+                let total = contracts.len();
+                self.update(|state| state["total"] = json!(total)).await;
+                if kind != DataKind::Funding {
+                    // BTC 要多下载一段，用来计算 200 日均线。
+                    let regime_from = from - (REGIME_AVERAGE + REGIME_SLOPE + 10) as i64 * DAY;
+                    self.fetch.cached_candles("BTCUSDT", Kind::HourKlines, regime_from, now).await?;
+                }
+                for index in 0..contracts.len() {
+                    if let Some(reason) = self.interrupted() {
+                        // 中途取消时也保存已经补上的下架时间。
+                        let _ = self.fetch.history().save_contracts(&contracts);
+                        return Err(reason);
+                    }
+                    let contract = contracts[index].clone();
+                    let start = contract.onboard.map_or(from, |onboard| from.max(onboard.div_euclid(HOUR) * HOUR));
+                    let end = contract.delisted.map_or(now, |delisted| delisted.min(now));
+                    if end <= start {
+                        self.skip().await;
+                        self.record(index, &contract.symbol, Ok(())).await;
+                        continue;
+                    }
+                    let result = self.download(&contract, kind, start, end).await.map(|last_trade| {
+                        // 只在公开数据仓库里的合约，以最后一根有成交的K线作为下架时间。
+                        if contract.delisted.is_none() && contract.status != "TRADING" && last_trade.is_some() {
+                            contracts[index].delisted = last_trade;
+                        }
+                    });
+                    self.record(index, &contract.symbol, result).await;
+                }
+                self.fetch.history().save_contracts(&contracts).map_err(|_| "无法保存合约列表。".to_owned())
+            }
+            DataKind::Minute | DataKind::OpenInterest => {
+                let symbols = self.top_contracts(MINUTE_TOP).await?;
+                let total = symbols.len();
+                self.update(|state| state["total"] = json!(total)).await;
+                for (index, symbol) in symbols.iter().enumerate() {
+                    if let Some(reason) = self.interrupted() {
+                        return Err(reason);
+                    }
+                    let result = if kind == DataKind::Minute {
+                        self.fetch.cached_bars(symbol, from, now).await.map(|_| ())
+                    } else {
+                        self.fetch.cached_points(symbol, Kind::OpenInterest, now - OPEN_INTEREST_DAYS * DAY, now).await.map(|_| ())
+                    };
+                    self.record(index, symbol, result).await;
+                }
+                Ok(())
+            }
+            DataKind::Premium | DataKind::Liquidation | DataKind::LongShort => Err("这类数据不能手动更新。".into()),
+        }
+    }
+
+    /// 下载一个合约的小时K线和 / 或资金费率，返回合约最后一次有成交的时间。
+    /// 只更新资金费率时，用本地已有的小时K线判断最后交易时间，不重新下载K线。
+    async fn download(&self, contract: &Contract, kind: DataKind, start: i64, end: i64) -> Result<Option<i64>, String> {
+        let bars = if kind == DataKind::Funding {
+            self.fetch.history().candles(Kind::HourKlines, &contract.symbol, start, end).map_err(|_| "无法读取本地K线。".to_owned())?
+        } else {
+            self.fetch.cached_candles(&contract.symbol, Kind::HourKlines, start, end).await?
+        };
         let last_trade = trading_bars(&bars, contract.delisted).last().map(|bar| bar.end);
-        let funding_end = last_trade.unwrap_or(end).min(end);
-        if funding_end > start {
-            self.fetch.cached_points(&contract.symbol, Kind::Funding, start, funding_end).await?;
+        if kind != DataKind::Hourly {
+            let funding_end = last_trade.unwrap_or(end).min(end);
+            if funding_end > start {
+                self.fetch.cached_points(&contract.symbol, Kind::Funding, start, funding_end).await?;
+            }
         }
         Ok(last_trade)
     }
@@ -361,6 +579,49 @@ mod tests {
         let contracts = universe(&info, &archived);
         let summary: Vec<_> = contracts.iter().map(|c| (c.symbol.as_str(), c.delisted, c.status.as_str())).collect();
         assert_eq!(summary, vec![("BTCUSDT", None, "TRADING"), ("OMGUSDT", Some(50), "SETTLING"), ("SRMUSDT", None, "ARCHIVED")]);
+    }
+
+    #[test]
+    fn data_kinds_parse_and_only_downloaded_data_can_be_updated() {
+        let params: PrepareParams = serde_json::from_value(json!({"kind": "openInterest"})).unwrap();
+        assert_eq!((params.kind, params.days), (DataKind::OpenInterest, 730));
+        // 不传种类时是旧的「一起下载」。
+        assert_eq!(serde_json::from_value::<PrepareParams>(json!({"days": 365})).unwrap().kind, DataKind::All);
+        assert!(PrepareParams { days: 730, kind: DataKind::Liquidation }.validate().unwrap_err().contains("自动记录"));
+        assert!(PrepareParams { days: 30, kind: DataKind::Minute }.validate().is_ok());
+        assert!(PrepareParams { days: 60, kind: DataKind::Minute }.validate().is_err());
+        assert!(PrepareParams { days: 10, kind: DataKind::Hourly }.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_clears_one_kind_of_data_and_its_coverage() {
+        let (_stop, stopped) = watch::channel(false);
+        let history = Arc::new(History::open_memory().unwrap());
+        history.save_candles(Kind::HourKlines, "BTCUSDT", &[bar(0, 1.0, 1.0)]).unwrap();
+        history.set_coverage("BTCUSDT", Kind::HourKlines, 0, HOUR).unwrap();
+        history.save_points("BTCUSDT", Kind::Funding, &[(0, 0.0001)]).unwrap();
+        let dataset = Dataset::new(Arc::clone(&history), stopped).unwrap();
+        dataset.delete(DeleteParams { kind: DataKind::Hourly }).await.unwrap();
+        assert!(history.candles(Kind::HourKlines, "BTCUSDT", 0, HOUR).unwrap().is_empty());
+        assert_eq!(history.coverage("BTCUSDT", Kind::HourKlines).unwrap(), None);
+        // 其他种类不受影响。
+        assert_eq!(history.points("BTCUSDT", Kind::Funding, 0, HOUR).unwrap().len(), 1);
+        // 正在更新时不能删除。
+        *dataset.state.lock().await = json!({"status": "running"});
+        assert!(dataset.delete(DeleteParams { kind: DataKind::Funding }).await.unwrap_err().contains("取消更新"));
+        assert!(dataset.delete(DeleteParams { kind: DataKind::All }).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stopping_only_flags_a_running_download() {
+        let (_stop, stopped) = watch::channel(false);
+        let dataset = Dataset::new(Arc::new(History::open_memory().unwrap()), stopped).unwrap();
+        // 没在下载时点停止，什么也不做。
+        assert_eq!(dataset.cancel().await["status"], "idle");
+        assert!(!dataset.cancel.load(Ordering::Relaxed));
+        *dataset.state.lock().await = json!({"status": "running"});
+        dataset.cancel().await;
+        assert!(dataset.cancel.load(Ordering::Relaxed));
     }
 
     #[test]

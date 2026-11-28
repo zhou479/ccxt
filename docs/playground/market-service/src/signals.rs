@@ -529,7 +529,7 @@ impl Signals {
             "scan": scan,
             "barriers": PLANS.iter().map(|plan| plan.describe()).collect::<Vec<_>>(),
             "horizons": HORIZONS,
-            "archive": self.fetch.history().status().ok(),
+            "archive": self.fetch.shared_history().status_in_background().await,
         }))
     }
 
@@ -854,6 +854,10 @@ impl Fetcher {
 
     pub(crate) fn history(&self) -> &History {
         &self.history
+    }
+
+    pub(crate) fn shared_history(&self) -> Arc<History> {
+        Arc::clone(&self.history)
     }
 
     pub(crate) async fn listed(&self) -> Result<Vec<String>, String> {

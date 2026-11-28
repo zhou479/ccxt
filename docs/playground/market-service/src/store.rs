@@ -106,6 +106,11 @@ impl Store {
         self.1.with_extension("binance-account.json")
     }
 
+    /// 最近一次资金费率检验的结果，服务重启后读回。
+    pub fn study_path(&self) -> PathBuf {
+        self.1.with_extension("study-funding.json")
+    }
+
     /// 一键全平后的「暂停开仓」状态。
     pub fn trading_guard_path(&self) -> PathBuf {
         self.1.with_extension("trading-guard.json")
